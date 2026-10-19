@@ -18,7 +18,8 @@ export type AgentEvent =
   | { kind: 'text'; text: string }
   | { kind: 'tool_use'; tool: string; summary: string }
   | { kind: 'changeset_staged'; changeSetId: string; preview: ChangePreviewItem[] }
-  | { kind: 'error'; message: string };
+  | { kind: 'error'; message: string }
+  | { kind: 'stopped'; reason?: string };
 
 export interface AgentTurnOptions {
   provider: Provider;
@@ -30,6 +31,7 @@ export interface AgentTurnOptions {
   onEvent: (ev: AgentEvent) => void;
   onUsage?: (usage: { inputTokens: number; outputTokens: number }) => void;
   maxIterations?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface AgentTurnResult {
@@ -66,6 +68,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
     onEvent,
     onUsage,
     maxIterations = 16,
+    abortSignal,
   } = options;
 
   let system = buildSystemPrompt(workbookName);
@@ -91,16 +94,40 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
   };
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
-    const response = await withRetry(() =>
-      provider.chat({
-        messages,
-        tools: provider.supportsTools ? specs : undefined,
-        temperature: 0,
-        // Reasoning models spend completion tokens on internal reasoning
-        // before any visible output; a small budget yields empty replies.
-        maxTokens: 16384,
-      }),
-    );
+    if (abortSignal?.aborted) {
+      emit({ kind: 'stopped', reason: 'Generation stopped by user.' });
+      return { history: options.history };
+    }
+
+    let response;
+    try {
+      response = await withRetry(() =>
+        provider.chat({
+          messages,
+          tools: provider.supportsTools ? specs : undefined,
+          temperature: 0,
+          // Reasoning models spend completion tokens on internal reasoning
+          // before any visible output; a small budget yields empty replies.
+          maxTokens: 16384,
+          abortSignal,
+        }),
+      );
+    } catch (e) {
+      if (
+        abortSignal?.aborted ||
+        (e instanceof Error && (e.name === 'AbortError' || e.message.toLowerCase().includes('abort')))
+      ) {
+        emit({ kind: 'stopped', reason: 'Generation stopped by user.' });
+        return { history: options.history };
+      }
+      throw e;
+    }
+
+    if (abortSignal?.aborted) {
+      emit({ kind: 'stopped', reason: 'Generation stopped by user.' });
+      return { history: options.history };
+    }
+
     onUsage?.(response.usage);
 
     let toolCalls = response.toolCalls;
@@ -134,7 +161,27 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
     }
 
     for (const call of toolCalls) {
-      const result = await executeToolCall(call.name, call.argsJson, executor, pendingOps, emit);
+      if (abortSignal?.aborted) {
+        emit({ kind: 'stopped', reason: 'Generation stopped by user.' });
+        return { history: options.history };
+      }
+      let result: string;
+      try {
+        result = await executeToolCall(call.name, call.argsJson, executor, pendingOps, emit);
+      } catch (e) {
+        if (
+          abortSignal?.aborted ||
+          (e instanceof Error && (e.name === 'AbortError' || e.message.toLowerCase().includes('abort')))
+        ) {
+          emit({ kind: 'stopped', reason: 'Generation stopped by user.' });
+          return { history: options.history };
+        }
+        throw e;
+      }
+      if (abortSignal?.aborted) {
+        emit({ kind: 'stopped', reason: 'Generation stopped by user.' });
+        return { history: options.history };
+      }
       messages.push({ role: 'tool', toolCallId: call.id, content: result });
     }
   }

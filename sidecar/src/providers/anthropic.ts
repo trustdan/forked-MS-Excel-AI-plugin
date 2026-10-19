@@ -5,6 +5,7 @@ import {
   type Provider,
   type ToolCall,
 } from './types.js';
+import { assertLoopbackUrl } from '../networkGuard.js';
 
 interface AnthropicContentBlock {
   type: string;
@@ -21,9 +22,11 @@ export class AnthropicProvider implements Provider {
 
   constructor(
     readonly model: string,
-    private readonly apiKey: string,
-    private readonly baseUrl = 'https://api.anthropic.com',
-  ) {}
+    private readonly apiKey: string = 'lm-studio',
+    private readonly baseUrl = 'http://127.0.0.1:1234/v1',
+  ) {
+    assertLoopbackUrl(this.baseUrl);
+  }
 
   async chat(options: ChatRequestOptions): Promise<ChatResponse> {
     const system = options.messages.find((m) => m.role === 'system');
@@ -67,11 +70,14 @@ export class AnthropicProvider implements Provider {
       }));
     }
 
-    const res = await fetch(`${this.baseUrl}/v1/messages`, {
+    const endpoint = `${this.baseUrl.replace(/\/$/, '')}/v1/messages`;
+    assertLoopbackUrl(endpoint);
+
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-api-key': this.apiKey,
+        'x-api-key': this.apiKey || 'lm-studio',
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(body),

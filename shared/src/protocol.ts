@@ -37,6 +37,7 @@ export type ToolResult = Envelope<
 export type ApproveChangeSet = Envelope<'approve_changeset', { changeSetId: string }>;
 export type RejectChangeSet = Envelope<'reject_changeset', { changeSetId: string }>;
 export type UndoChangeSet = Envelope<'undo_changeset', { changeSetId: string }>;
+export type AbortRequest = Envelope<'abort', { reason?: string }>;
 
 export type ClientMessage =
   | ClientHello
@@ -44,7 +45,8 @@ export type ClientMessage =
   | ToolResult
   | ApproveChangeSet
   | RejectChangeSet
-  | UndoChangeSet;
+  | UndoChangeSet
+  | AbortRequest;
 
 /* ---------- sidecar -> add-in ---------- */
 
@@ -72,6 +74,7 @@ export type AgentEvent = Envelope<
   | { kind: 'changeset_applied'; changeSetId: string }
   | { kind: 'changeset_undone'; changeSetId: string }
   | { kind: 'error'; message: string }
+  | { kind: 'stopped'; reason?: string }
   | { kind: 'done' }
 >;
 

@@ -11,6 +11,7 @@
     "test": "vitest run",
     "dev": "tsc -p tsconfig.json && node --no-warnings dist/index.js",
     "start": "node --no-warnings dist/index.js",
+    "start:offline": "node ../scripts/run-offline.mjs",
     "smoke": "node --no-warnings scripts/smoke.mjs"
   },
   "dependencies": {

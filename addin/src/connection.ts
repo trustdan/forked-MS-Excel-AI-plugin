@@ -69,6 +69,7 @@ export type AgentEventPayload = Extract<ServerMessage, { type: 'agent_event' }>[
 
 export interface SidecarConnection {
   sendChat(message: string): void;
+  abort(reason?: string): void;
   approve(changeSetId: string): void;
   reject(changeSetId: string): void;
   undo(changeSetId: string): void;
@@ -179,6 +180,7 @@ export function connect(options: {
 
   return {
     sendChat: (message) => send('chat', { message }),
+    abort: (reason) => send('abort', { reason }),
     approve: (changeSetId) => send('approve_changeset', { changeSetId }),
     reject: (changeSetId) => send('reject_changeset', { changeSetId }),
     undo: (changeSetId) => send('undo_changeset', { changeSetId }),

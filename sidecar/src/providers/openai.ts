@@ -5,6 +5,7 @@ import {
   type Provider,
   type ToolCall,
 } from './types.js';
+import { assertLoopbackUrl } from '../networkGuard.js';
 
 /**
  * OpenAI Chat Completions adapter. With a custom baseUrl this same adapter
@@ -25,10 +26,12 @@ export class OpenAIProvider implements Provider {
 
   constructor(
     readonly model: string,
-    private readonly apiKey: string | undefined,
-    private readonly baseUrl = 'https://api.openai.com/v1',
+    private readonly apiKey: string | undefined = 'lm-studio',
+    private readonly baseUrl = 'http://127.0.0.1:1234/v1',
     readonly id: string = 'openai',
-  ) {}
+  ) {
+    assertLoopbackUrl(this.baseUrl);
+  }
 
   async chat(options: ChatRequestOptions): Promise<ChatResponse> {
     // At most one retry per adaptable parameter.
@@ -103,9 +106,13 @@ export class OpenAIProvider implements Provider {
     }
 
     const headers: Record<string, string> = { 'content-type': 'application/json' };
-    if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+    const key = this.apiKey || 'lm-studio';
+    headers.authorization = `Bearer ${key}`;
 
-    return fetch(`${this.baseUrl}/chat/completions`, {
+    const endpoint = `${this.baseUrl.replace(/\/$/, '')}/chat/completions`;
+    assertLoopbackUrl(endpoint);
+
+    return fetch(endpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),

@@ -15,6 +15,7 @@ export class Session {
   readonly changeSets: ChangeSetManager;
   private history: ChatMessage[] = [];
   private busy = false;
+  private currentAbortController: AbortController | null = null;
 
   constructor(
     private readonly ws: WebSocket,
@@ -34,12 +35,22 @@ export class Session {
     }
   }
 
+  handleAbort(reason?: string): void {
+    if (this.currentAbortController) {
+      console.log(`[chat] aborting in-flight turn: ${reason ?? 'user requested'}`);
+      this.currentAbortController.abort();
+      this.executor.abortAll?.(reason ?? 'Turn aborted');
+    }
+  }
+
   async handleChat(message: string): Promise<void> {
     if (this.busy) {
       this.emit({ kind: 'error', message: 'The agent is already working on a request.' });
       return;
     }
     this.busy = true;
+    const abortController = new AbortController();
+    this.currentAbortController = abortController;
     const startedAt = Date.now();
     let totalIn = 0;
     let totalOut = 0;
@@ -60,6 +71,7 @@ export class Session {
         workbookName: this.workbookName,
         history: this.history,
         userMessage: message + memoryNote,
+        abortSignal: abortController.signal,
         onEvent: (ev) => this.emit(ev),
         onUsage: (usage) => {
           totalIn += usage.inputTokens;
@@ -72,18 +84,25 @@ export class Session {
           });
         },
       });
-      this.history = result.history;
-      // Bound history growth; compaction lands with the indexer work.
-      if (this.history.length > 60) this.history = this.history.slice(-40);
+      if (!abortController.signal.aborted) {
+        this.history = result.history;
+        // Bound history growth; compaction lands with the indexer work.
+        if (this.history.length > 60) this.history = this.history.slice(-40);
+      }
       console.log(
-        `[chat] ${this.workbookName} · ${provider.model} · ${Date.now() - startedAt}ms · tokens ${totalIn} in / ${totalOut} out${result.stagedChangeSetId ? ' · change-set staged' : ''}`,
+        `[chat] ${this.workbookName} · ${provider.model} · ${Date.now() - startedAt}ms · tokens ${totalIn} in / ${totalOut} out${result.stagedChangeSetId ? ' · change-set staged' : ''}${abortController.signal.aborted ? ' · aborted' : ''}`,
       );
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error(`[chat] turn failed after ${Date.now() - startedAt}ms: ${message}`);
-      this.emit({ kind: 'error', message });
+      if (abortController.signal.aborted) {
+        console.log(`[chat] turn aborted after ${Date.now() - startedAt}ms`);
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(`[chat] turn failed after ${Date.now() - startedAt}ms: ${message}`);
+        this.emit({ kind: 'error', message });
+      }
     } finally {
       this.busy = false;
+      this.currentAbortController = null;
       this.emit({ kind: 'done' });
     }
   }

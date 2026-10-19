@@ -32,7 +32,13 @@ export class FunctionEngine {
     provider: Provider,
     req: FunctionRequest,
     onUsage?: (u: { inputTokens: number; outputTokens: number }) => void,
+    abortSignal?: AbortSignal,
   ): Promise<string> {
+    if (abortSignal?.aborted) {
+      const err = new Error('Function call was aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
     const key = cacheKey(provider, req);
 
     const cached = this.db.prepare('SELECT value FROM fn_cache WHERE key = ?').get(key) as
@@ -44,6 +50,11 @@ export class FunctionEngine {
     if (existing) return existing;
 
     const task = this.withSlot(async () => {
+      if (abortSignal?.aborted) {
+        const err = new Error('Function call was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
       const { system, user } = buildPrompt(req);
       const response = await withRetry(() =>
         provider.chat({
@@ -53,8 +64,14 @@ export class FunctionEngine {
           ],
           temperature: 0,
           maxTokens: 1024,
+          abortSignal,
         }),
       );
+      if (abortSignal?.aborted) {
+        const err = new Error('Function call was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
       onUsage?.(response.usage);
       let value = response.text.trim();
       if (req.kind === 'classify' && req.categories) {
@@ -64,7 +81,7 @@ export class FunctionEngine {
         .prepare('INSERT OR REPLACE INTO fn_cache (key, value, created_at) VALUES (?, ?, ?)')
         .run(key, value, new Date().toISOString());
       return value;
-    });
+    }, abortSignal);
 
     this.inFlight.set(key, task);
     try {
@@ -74,9 +91,29 @@ export class FunctionEngine {
     }
   }
 
-  private async withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  private async withSlot<T>(fn: () => Promise<T>, abortSignal?: AbortSignal): Promise<T> {
+    if (abortSignal?.aborted) {
+      const err = new Error('Function call was aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
     if (this.active >= this.concurrency) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
+      await new Promise<void>((resolve, reject) => {
+        let resume: () => void;
+        const onAbort = (): void => {
+          const idx = this.queue.indexOf(resume);
+          if (idx >= 0) this.queue.splice(idx, 1);
+          const err = new Error('Function call was aborted');
+          err.name = 'AbortError';
+          reject(err);
+        };
+        resume = (): void => {
+          abortSignal?.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        abortSignal?.addEventListener('abort', onAbort, { once: true });
+        this.queue.push(resume);
+      });
     }
     this.active++;
     try {

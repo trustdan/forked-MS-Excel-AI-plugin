@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "echo \"covered by typecheck and sidecar integration tests\"",
+    "test": "vitest run",
     "dev": "vite"
   },
   "dependencies": {
@@ -16,12 +16,15 @@
     "react-dom": "^18.3.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.3",
     "@types/custom-functions-runtime": "^1.6.12",
     "@types/office-js": "^1.0.460",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",
+    "jsdom": "^30.1.3",
     "typescript": "^5.7.0",
-    "vite": "^6.0.0"
+    "vite": "^6.0.0",
+    "vitest": "^3.2.6"
   }
 }

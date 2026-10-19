@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { WebSocket } from 'ws';
 import { openDb } from '../src/db.js';
 import { startServer, type SidecarServer } from '../src/server.js';
 
@@ -78,4 +79,80 @@ describe('sidecar HTTP API', () => {
     const body = (await list.json()) as { entries: { content: string }[] };
     expect(body.entries[0]?.content).toBe('prefers ISO dates');
   });
+
+  it('handles abort message over WebSocket to stop in-flight generation', async () => {
+    const { base, token } = await boot();
+    const wsUrl = `${base.replace('http', 'ws')}/ws?token=${token}`;
+    const ws = new WebSocket(wsUrl);
+
+    const received: { type: string; payload: unknown }[] = [];
+    ws.on('message', (data) => {
+      received.push(JSON.parse(data.toString()));
+    });
+
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+
+    // Send client hello
+    ws.send(
+      JSON.stringify({
+        v: 1,
+        id: '1',
+        type: 'hello',
+        payload: { token, workbookId: 'wb1', workbookName: 'Wb.xlsx', client: 'addin' },
+      }),
+    );
+
+    // Wait for hello_ack
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (received.some((m) => m.type === 'hello_ack')) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 10);
+    });
+
+    // Start a chat turn
+    ws.send(
+      JSON.stringify({
+        v: 1,
+        id: '2',
+        type: 'chat',
+        payload: { message: 'Calculate something complex' },
+      }),
+    );
+
+    // Immediately send abort
+    ws.send(
+      JSON.stringify({
+        v: 1,
+        id: '3',
+        type: 'abort',
+        payload: { reason: 'user_requested' },
+      }),
+    );
+
+    // Wait for done event
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        const events = received
+          .filter((m) => m.type === 'agent_event')
+          .map((m) => m.payload as { kind: string });
+        if (events.some((e) => e.kind === 'done')) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 10);
+    });
+
+    const agentEvents = received
+      .filter((m) => m.type === 'agent_event')
+      .map((m) => m.payload as { kind: string });
+
+    expect(agentEvents.some((e) => e.kind === 'stopped' || e.kind === 'error')).toBe(true);
+    expect(agentEvents.some((e) => e.kind === 'done')).toBe(true);
+
+    ws.close();
+  });
 });
+

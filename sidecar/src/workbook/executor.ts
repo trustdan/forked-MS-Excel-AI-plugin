@@ -21,4 +21,6 @@ export interface WorkbookExecutor {
   find(query: string, sheet?: string): Promise<FindMatch[]>;
   /** Apply already-approved change ops, in order. Atomic per call where the host allows. */
   applyOps(ops: ChangeOp[]): Promise<void>;
+  /** Optional cancellation for pending operations. */
+  abortAll?(reason: string): void;
 }

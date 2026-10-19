@@ -8,20 +8,17 @@ export { OpenAIProvider } from './openai.js';
 export { ScriptedProvider, type ScriptedTurn } from './scripted.js';
 
 export function createProvider(config: ProviderConfig): Provider {
+  const baseUrl = config.baseUrl || 'http://127.0.0.1:1234/v1';
+  const apiKey = config.apiKey || 'lm-studio';
   switch (config.kind) {
     case 'anthropic': {
-      if (!config.apiKey) throw new ProviderError('Anthropic requires an API key');
-      return new AnthropicProvider(config.model, config.apiKey, config.baseUrl);
+      return new AnthropicProvider(config.model, apiKey, baseUrl);
     }
     case 'openai': {
-      if (!config.apiKey) throw new ProviderError('OpenAI requires an API key');
-      return new OpenAIProvider(config.model, config.apiKey, config.baseUrl);
+      return new OpenAIProvider(config.model, apiKey, baseUrl);
     }
     case 'openai-compatible': {
-      if (!config.baseUrl) {
-        throw new ProviderError('openai-compatible providers require a baseUrl (e.g. http://localhost:11434/v1)');
-      }
-      return new OpenAIProvider(config.model, config.apiKey, config.baseUrl, 'openai-compatible');
+      return new OpenAIProvider(config.model, apiKey, baseUrl, 'openai-compatible');
     }
   }
 }
@@ -38,6 +35,9 @@ export async function withRetry<T>(
       return await fn();
     } catch (e) {
       lastError = e;
+      if (e instanceof Error && (e.name === 'AbortError' || e.message.toLowerCase().includes('abort'))) {
+        throw e;
+      }
       const retryable = e instanceof ProviderError ? e.retryable : false;
       if (!retryable || i === attempts - 1) throw e;
       await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** i));

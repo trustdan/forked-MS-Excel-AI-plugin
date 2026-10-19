@@ -20,6 +20,7 @@ import { FunctionEngine } from './functions/batch.js';
 import { createProvider, ProviderError, type Provider } from './providers/index.js';
 import { BridgeExecutor } from './bridge.js';
 import { Session } from './session.js';
+import { assertLoopbackUrl } from './networkGuard.js';
 
 const SIDECAR_VERSION = '0.1.0';
 
@@ -38,7 +39,22 @@ const providerConfigSchema = z.object({
   kind: z.enum(['anthropic', 'openai', 'openai-compatible']),
   model: z.string().min(1),
   apiKey: z.string().min(1).optional(),
-  baseUrl: z.string().url().optional(),
+  baseUrl: z
+    .string()
+    .url()
+    .optional()
+    .refine(
+      (u) => {
+        if (!u) return true;
+        try {
+          assertLoopbackUrl(u);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      { message: 'baseUrl must be a local loopback address (127.0.0.1, localhost, [::1])' },
+    ),
 });
 
 export async function startServer(options: {
@@ -54,10 +70,13 @@ export async function startServer(options: {
 
   let cachedProvider: { provider: Provider; fingerprint: string } | null = null;
   const getProvider = (): Provider => {
-    const active = activeProvider(loadSettings());
-    if (!active) {
-      throw new ProviderError('No model configured. Open Settings in the task pane and add one.');
-    }
+    const active = activeProvider(loadSettings()) ?? {
+      id: 'default-lm-studio',
+      kind: 'openai-compatible',
+      model: 'local-model',
+      baseUrl: 'http://127.0.0.1:1234/v1',
+      apiKey: 'lm-studio',
+    };
     const fingerprint = JSON.stringify(active);
     if (!cachedProvider || cachedProvider.fingerprint !== fingerprint) {
       cachedProvider = { provider: createProvider(active), fingerprint };
@@ -210,11 +229,26 @@ export async function startServer(options: {
         const schema = z.object({
           kind: z.enum(['anthropic', 'openai', 'openai-compatible']),
           apiKey: z.string().optional(),
-          baseUrl: z.string().url().optional(),
+          baseUrl: z
+            .string()
+            .url()
+            .optional()
+            .refine(
+              (u) => {
+                if (!u) return true;
+                try {
+                  assertLoopbackUrl(u);
+                  return true;
+                } catch {
+                  return false;
+                }
+              },
+              { message: 'baseUrl must be a local loopback address' },
+            ),
         });
         const parsed = schema.safeParse(await readJson(req));
         if (!parsed.success) {
-          sendJson(res, 400, { models: [], error: 'Invalid request' });
+          sendJson(res, 400, { models: [], error: parsed.error.issues.map((i) => i.message).join('; ') });
           return;
         }
         sendJson(res, 200, await listModels(parsed.data));
@@ -233,14 +267,33 @@ export async function startServer(options: {
           sendJson(res, 400, { error: 'Invalid function request' });
           return;
         }
+        const controller = new AbortController();
+        req.on('close', () => {
+          if (!res.writableEnded) {
+            controller.abort();
+          }
+        });
         try {
           const provider = getProvider();
-          const value = await functions.run(provider, parsed.data, (usage) =>
-            ledger.record({ provider: provider.id, model: provider.model, feature: 'functions', ...usage }),
+          const value = await functions.run(
+            provider,
+            parsed.data,
+            (usage) =>
+              ledger.record({ provider: provider.id, model: provider.model, feature: 'functions', ...usage }),
+            controller.signal,
           );
           sendJson(res, 200, { value });
         } catch (e) {
-          sendJson(res, 502, { error: e instanceof Error ? e.message : 'Function failed' });
+          if (
+            controller.signal.aborted ||
+            (e instanceof Error && (e.name === 'AbortError' || e.message.toLowerCase().includes('abort')))
+          ) {
+            if (!res.writableEnded) {
+              sendJson(res, 499, { error: 'Calculation canceled' });
+            }
+          } else {
+            sendJson(res, 502, { error: e instanceof Error ? e.message : 'Function failed' });
+          }
         }
         return;
       }
@@ -353,6 +406,9 @@ export async function startServer(options: {
           case 'chat':
             await session?.handleChat(msg.payload.message);
             break;
+          case 'abort':
+            session?.handleAbort(msg.payload?.reason);
+            break;
           case 'approve_changeset':
             await session?.handleApprove(msg.payload.changeSetId);
             break;
@@ -366,7 +422,10 @@ export async function startServer(options: {
       })();
     });
 
-    ws.on('close', () => bridge?.abortAll('Add-in disconnected'));
+    ws.on('close', () => {
+      session?.handleAbort('Add-in disconnected');
+      bridge?.abortAll('Add-in disconnected');
+    });
   });
 
   const port = options.port ?? 8923;
@@ -432,17 +491,20 @@ async function listModels(config: {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8_000);
   try {
+    const rawBase = config.baseUrl || 'http://127.0.0.1:1234/v1';
+    assertLoopbackUrl(rawBase);
     let endpoint: string;
     const headers: Record<string, string> = {};
     if (config.kind === 'anthropic') {
-      endpoint = `${config.baseUrl ?? 'https://api.anthropic.com'}/v1/models`;
+      endpoint = `${rawBase.replace(/\/$/, '')}/v1/models`;
       if (config.apiKey) headers['x-api-key'] = config.apiKey;
       headers['anthropic-version'] = '2023-06-01';
     } else {
-      const base = config.baseUrl ?? 'https://api.openai.com/v1';
-      endpoint = `${base.replace(/\/$/, '')}/models`;
-      if (config.apiKey) headers.authorization = `Bearer ${config.apiKey}`;
+      endpoint = `${rawBase.replace(/\/$/, '')}/models`;
+      const key = config.apiKey || 'lm-studio';
+      headers.authorization = `Bearer ${key}`;
     }
+    assertLoopbackUrl(endpoint);
     const res = await fetch(endpoint, { headers, signal: controller.signal });
     if (!res.ok) return { models: [], error: `Endpoint answered ${res.status}` };
     const data = (await res.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };

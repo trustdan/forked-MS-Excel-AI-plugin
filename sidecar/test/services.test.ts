@@ -100,4 +100,76 @@ describe('function engine', () => {
     const system = provider.requests[0]?.messages.find((m) => m.role === 'system');
     expect(system && 'content' in system ? system.content : '').toContain('untrusted');
   });
+
+  it('aborts function calculation cleanly when abortSignal is triggered', async () => {
+    const db = openDb(':memory:');
+    const engine = new FunctionEngine(db);
+    const controller = new AbortController();
+
+    const provider: ScriptedProvider = new (class extends ScriptedProvider {
+      constructor() {
+        super([]);
+      }
+      override async chat(): Promise<never> {
+        controller.abort();
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+    })();
+
+    await expect(
+      engine.run(
+        provider,
+        { kind: 'ai', prompt: 'calculate', input: 'test' },
+        undefined,
+        controller.signal,
+      ),
+    ).rejects.toThrow();
+
+    // Verify aborted result was not stored in cache
+    const cached = db.prepare('SELECT COUNT(*) as count FROM fn_cache').get() as { count: number };
+    expect(cached.count).toBe(0);
+  });
+
+  it('cancels queued function calls waiting for concurrency slots', async () => {
+    const db = openDb(':memory:');
+    const engine = new FunctionEngine(db, 1); // concurrency 1
+    const blockerController = new AbortController();
+
+    let unblockFirst: () => void = () => {};
+    const blockerProvider: ScriptedProvider = new (class extends ScriptedProvider {
+      constructor() {
+        super([]);
+      }
+      override chat(): Promise<never> {
+        return new Promise((_, reject) => {
+          unblockFirst = () => reject(new Error('unblocked'));
+        });
+      }
+    })();
+
+    // Fill slot 1
+    const p1 = engine.run(
+      blockerProvider,
+      { kind: 'ai', prompt: 'first', input: '1' },
+    ).catch(() => {});
+
+    // Queue call 2, then abort it while in queue
+    const queuedController = new AbortController();
+    const p2 = engine.run(
+      blockerProvider,
+      { kind: 'ai', prompt: 'second', input: '2' },
+      undefined,
+      queuedController.signal,
+    );
+
+    queuedController.abort();
+    await expect(p2).rejects.toThrow('aborted');
+
+    // Clean up first blocker
+    unblockFirst();
+    await p1;
+  });
 });
+

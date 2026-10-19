@@ -1,4 +1,11 @@
-import { indexToCol, type BorderFormat, type CellData, type ChangeOp, type WorkbookMap } from '@excelai/shared';
+import {
+  indexToCol,
+  parseA1,
+  type BorderFormat,
+  type CellData,
+  type ChangeOp,
+  type WorkbookMap,
+} from '@excelai/shared';
 
 /**
  * The "hands": executes workbook tools against real Excel via Office.js.
@@ -51,71 +58,145 @@ export async function readRange(rangeRef: string): Promise<CellData[][]> {
   });
 }
 
+const BATCH_SIZE = 50;
+
+/**
+ * Checks whether an op alters workbook topology or shifts row/column coordinates,
+ * requiring a synchronization boundary before subsequent operations run.
+ */
+function isStructuralOp(op: ChangeOp): boolean {
+  switch (op.kind) {
+    case 'add_sheet':
+    case 'rename_sheet':
+    case 'delete_sheet':
+    case 'insert_rows':
+    case 'delete_rows':
+    case 'insert_cols':
+    case 'delete_cols':
+      return true;
+    default:
+      return false;
+  }
+}
+
 export async function applyOps(ops: ChangeOp[]): Promise<void> {
+  if (ops.length === 0) return;
+
   await Excel.run(async (context) => {
+    const addedSheets = new Map<string, Excel.Worksheet>();
+    let pendingOpsCount = 0;
+
     for (const op of ops) {
+
+      // If the upcoming op is structural and we have pending queued mutations,
+      // flush them first so the sheet is in a consistent state.
+      if (isStructuralOp(op) && pendingOpsCount > 0) {
+        await context.sync();
+        pendingOpsCount = 0;
+      }
+
       switch (op.kind) {
         case 'add_sheet': {
-          context.workbook.worksheets.add(op.name);
+          const ws = context.workbook.worksheets.add(op.name);
+          addedSheets.set(op.name, ws);
+          // Structural: sync so the sheet exists in the workbook collection
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'clear_range': {
-          getRange(context, op.range).clear(Excel.ClearApplyTo.contents);
+          getRange(context, op.range, addedSheets).clear(Excel.ClearApplyTo.contents);
+          pendingOpsCount++;
           break;
         }
         case 'rename_sheet': {
-          context.workbook.worksheets.getItem(op.name).name = op.newName;
+          const sheet = addedSheets.get(op.name) ?? context.workbook.worksheets.getItem(op.name);
+          sheet.name = op.newName;
+          addedSheets.delete(op.name);
+          addedSheets.set(op.newName, sheet);
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'delete_sheet': {
-          context.workbook.worksheets.getItem(op.name).delete();
+          const sheet = addedSheets.get(op.name) ?? context.workbook.worksheets.getItem(op.name);
+          sheet.delete();
+          addedSheets.delete(op.name);
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'insert_rows': {
           // Row addresses are 1-based in A1 notation; op.at is 0-based.
-          const sheet = context.workbook.worksheets.getItem(op.sheet);
+          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
           sheet.getRange(`${op.at + 1}:${op.at + op.count}`).insert(Excel.InsertShiftDirection.down);
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'delete_rows': {
-          const sheet = context.workbook.worksheets.getItem(op.sheet);
+          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
           sheet.getRange(`${op.at + 1}:${op.at + op.count}`).delete(Excel.DeleteShiftDirection.up);
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'insert_cols': {
-          const sheet = context.workbook.worksheets.getItem(op.sheet);
+          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
           sheet
             .getRange(`${indexToCol(op.at)}:${indexToCol(op.at + op.count - 1)}`)
             .insert(Excel.InsertShiftDirection.right);
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'delete_cols': {
-          const sheet = context.workbook.worksheets.getItem(op.sheet);
+          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
           sheet
             .getRange(`${indexToCol(op.at)}:${indexToCol(op.at + op.count - 1)}`)
             .delete(Excel.DeleteShiftDirection.left);
+          await context.sync();
+          pendingOpsCount = 0;
           break;
         }
         case 'sort_range': {
-          const range = getRange(context, op.range);
+          const range = getRange(context, op.range, addedSheets);
           range.sort.apply(
             [{ key: op.keyOffset, ascending: op.ascending }],
             false,
             op.hasHeader,
             Excel.SortOrientation.rows,
           );
+          pendingOpsCount++;
           break;
         }
         case 'format_range': {
-          const range = getRange(context, op.range);
+          const range = getRange(context, op.range, addedSheets);
           const f = op.format;
           if (f.numberFormat !== undefined) {
             // numberFormat must be a matrix matching the range dimensions.
-            range.load(['rowCount', 'columnCount']);
-            await context.sync();
-            range.numberFormat = Array.from({ length: range.rowCount }, () =>
-              Array.from({ length: range.columnCount }, () => f.numberFormat!),
-            );
+            let rowCount: number | null = null;
+            let colCount: number | null = null;
+            try {
+              const parsed = parseA1(op.range, 'Active');
+              rowCount = parsed.endRow - parsed.startRow + 1;
+              colCount = parsed.endCol - parsed.startCol + 1;
+            } catch {
+              // Non-standard address syntax, fallback to loading from Excel
+            }
+            if (rowCount !== null && colCount !== null && rowCount > 0 && colCount > 0) {
+              range.numberFormat = Array.from({ length: rowCount }, () =>
+                Array.from({ length: colCount! }, () => f.numberFormat!),
+              );
+            } else {
+              // Flush any prior queued ops and read dimensions
+              range.load(['rowCount', 'columnCount']);
+              await context.sync();
+              pendingOpsCount = 0;
+              range.numberFormat = Array.from({ length: range.rowCount }, () =>
+                Array.from({ length: range.columnCount }, () => f.numberFormat!),
+              );
+            }
           }
           if (f.bold !== undefined) range.format.font.bold = f.bold;
           if (f.italic !== undefined) range.format.font.italic = f.italic;
@@ -132,20 +213,31 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
           if (f.wrapText !== undefined) range.format.wrapText = f.wrapText;
           if (f.border !== undefined) applyBorders(range, f.border);
           if (f.autofitColumns) range.format.autofitColumns();
+          pendingOpsCount++;
           break;
         }
         case 'write_range': {
-          const range = getRange(context, op.range);
+          const range = getRange(context, op.range, addedSheets);
           // Setting `formulas` writes formulas for "=..." strings and treats
           // everything else as a literal value — one matrix handles both.
           const matrix = op.cells.map((row) =>
             row.map((cell) => (cell.formula !== undefined ? cell.formula : (cell.value ?? ''))),
           );
           range.formulas = matrix as unknown as string[][];
+          pendingOpsCount++;
           break;
         }
       }
-      // Apply ops in order so later ops can target sheets created earlier.
+
+      // Flush in batches of BATCH_SIZE to keep IPC messages bounded
+      if (pendingOpsCount >= BATCH_SIZE) {
+        await context.sync();
+        pendingOpsCount = 0;
+      }
+    }
+
+    // Flush any remaining batched operations at the end
+    if (pendingOpsCount > 0) {
       await context.sync();
     }
   });
@@ -225,14 +317,19 @@ export async function findCells(
   });
 }
 
-function getRange(context: Excel.RequestContext, ref: string): Excel.Range {
+function getRange(
+  context: Excel.RequestContext,
+  ref: string,
+  addedSheets?: Map<string, Excel.Worksheet>,
+): Excel.Range {
   const bang = ref.lastIndexOf('!');
   if (bang < 0) {
     return context.workbook.worksheets.getActiveWorksheet().getRange(ref);
   }
   const sheetName = ref.slice(0, bang).replace(/^'|'$/g, '');
   const address = ref.slice(bang + 1);
-  return context.workbook.worksheets.getItem(sheetName).getRange(address);
+  const sheet = addedSheets?.get(sheetName) ?? context.workbook.worksheets.getItem(sheetName);
+  return sheet.getRange(address);
 }
 
 /**
@@ -251,3 +348,83 @@ export async function getWorkbookIdentity(): Promise<{ id: string; name: string 
   const name = url.split(/[\\/]/).pop() || 'Workbook';
   return { id, name };
 }
+
+export interface SelectionInfo {
+  address: string;
+  cellCount: number;
+}
+
+/**
+ * Reads the user's currently selected range in Excel, if available.
+ */
+export async function getSelectedRangeInfo(): Promise<SelectionInfo | null> {
+  if (typeof Excel === 'undefined') return null;
+  try {
+    return await Excel.run(async (context) => {
+      const range = context.workbook.getSelectedRange();
+      range.load(['address', 'cellCount']);
+      await context.sync();
+      return { address: range.address, cellCount: range.cellCount };
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Registers a listener that triggers whenever the user selects a new range in Excel.
+ * Returns an unregister cleanup function.
+ */
+export function registerSelectionChangeListener(
+  onChange: (info: SelectionInfo) => void,
+): () => void {
+  if (typeof Office === 'undefined' || !Office.context?.document) return () => {};
+
+  let active = true;
+
+  const onSelectionChange = async (): Promise<void> => {
+    if (!active) return;
+    const info = await getSelectedRangeInfo();
+    if (info && active) onChange(info);
+  };
+
+  try {
+    Office.context.document.addHandlerAsync(
+      Office.EventType.DocumentSelectionChanged,
+      onSelectionChange,
+    );
+  } catch {
+    // Non-fatal if host environment doesn't support the event
+  }
+
+  return () => {
+    active = false;
+    try {
+      Office.context.document.removeHandlerAsync(
+        Office.EventType.DocumentSelectionChanged,
+        onSelectionChange,
+      );
+    } catch {
+      // Ignore cleanup failure
+    }
+  };
+}
+
+/**
+ * Selects/highlights a given range in Excel, jumping the sheet view to it.
+ */
+export async function selectRangeOnSheet(rangeRef: string): Promise<boolean> {
+  if (typeof Excel === 'undefined') return false;
+  try {
+    return await Excel.run(async (context) => {
+      const range = getRange(context, rangeRef);
+      range.select();
+      await context.sync();
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+

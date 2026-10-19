@@ -6,6 +6,7 @@
       "name": "AI",
       "description": "Ask the configured AI model. Returns a short value for the cell.",
       "result": { "type": "string" },
+      "options": { "cancelable": true },
       "parameters": [
         { "name": "prompt", "description": "What to do", "type": "string" },
         { "name": "input", "description": "Optional cell input", "type": "string", "optional": true }
@@ -16,6 +17,7 @@
       "name": "AI_CLASSIFY",
       "description": "Classify text into one of the given comma-separated categories.",
       "result": { "type": "string" },
+      "options": { "cancelable": true },
       "parameters": [
         { "name": "text", "description": "Text to classify", "type": "string" },
         { "name": "categories", "description": "Comma-separated category list", "type": "string" }
@@ -26,6 +28,7 @@
       "name": "AI_EXTRACT",
       "description": "Extract a field from text (empty string if absent).",
       "result": { "type": "string" },
+      "options": { "cancelable": true },
       "parameters": [
         { "name": "text", "description": "Source text", "type": "string" },
         { "name": "field", "description": "Field to extract, e.g. \"invoice number\"", "type": "string" }
@@ -36,6 +39,7 @@
       "name": "AI_TRANSLATE",
       "description": "Translate text into a target language.",
       "result": { "type": "string" },
+      "options": { "cancelable": true },
       "parameters": [
         { "name": "text", "description": "Text to translate", "type": "string" },
         { "name": "targetLang", "description": "Target language, e.g. \"French\"", "type": "string" }

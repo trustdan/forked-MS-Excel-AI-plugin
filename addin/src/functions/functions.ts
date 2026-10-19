@@ -9,7 +9,14 @@
 
 const SIDECAR_BASE = 'http://127.0.0.1:8923';
 
-async function callFunction(body: Record<string, unknown>): Promise<string> {
+function isInvocation(obj: unknown): obj is CustomFunctions.CancelableInvocation {
+  return typeof obj === 'object' && obj !== null && ('onCanceled' in obj || 'setResult' in obj);
+}
+
+async function callFunction(
+  body: Record<string, unknown>,
+  invocation?: CustomFunctions.CancelableInvocation,
+): Promise<string> {
   const token = localStorage.getItem('excelai-token');
   if (!token) {
     throw new CustomFunctions.Error(
@@ -17,45 +24,99 @@ async function callFunction(body: Record<string, unknown>): Promise<string> {
       'Not paired with the sidecar. Open the task pane first.',
     );
   }
-  const res = await fetch(`${SIDECAR_BASE}/api/functions/run`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
-  });
-  const data = (await res.json().catch(() => ({}))) as { value?: string; error?: string };
-  if (!res.ok || data.value === undefined) {
-    throw new CustomFunctions.Error(
-      CustomFunctions.ErrorCode.notAvailable,
-      data.error ?? `Sidecar error (${res.status})`,
-    );
+
+  const controller = new AbortController();
+  if (invocation) {
+    invocation.onCanceled = () => {
+      controller.abort();
+    };
   }
-  return data.value;
+
+  try {
+    const res = await fetch(`${SIDECAR_BASE}/api/functions/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const data = (await res.json().catch(() => ({}))) as { value?: string; error?: string };
+    if (!res.ok || data.value === undefined) {
+      throw new CustomFunctions.Error(
+        CustomFunctions.ErrorCode.notAvailable,
+        data.error ?? `Sidecar error (${res.status})`,
+      );
+    }
+    return data.value;
+  } catch (e) {
+    if (controller.signal.aborted || (e instanceof Error && e.name === 'AbortError')) {
+      throw new CustomFunctions.Error(
+        CustomFunctions.ErrorCode.notAvailable,
+        'Calculation canceled',
+      );
+    }
+    throw e;
+  }
 }
 
-export async function ai(prompt: string, input?: string): Promise<string> {
+export async function ai(
+  prompt: string,
+  inputOrInvocation?: string | CustomFunctions.CancelableInvocation,
+  maybeInvocation?: CustomFunctions.CancelableInvocation,
+): Promise<string> {
+  let input: string | undefined;
+  let invocation: CustomFunctions.CancelableInvocation | undefined;
+
+  if (isInvocation(inputOrInvocation)) {
+    invocation = inputOrInvocation;
+  } else {
+    input = inputOrInvocation;
+    invocation = maybeInvocation;
+  }
+
   const body: Record<string, unknown> = { kind: 'ai', prompt };
   if (input !== undefined && input !== null) body.input = String(input);
-  return callFunction(body);
+  return callFunction(body, invocation);
 }
 
-export async function aiClassify(text: string, categories: string): Promise<string> {
-  return callFunction({
-    kind: 'classify',
-    prompt: '',
-    input: String(text),
-    categories: String(categories)
-      .split(',')
-      .map((c) => c.trim())
-      .filter(Boolean),
-  });
+export async function aiClassify(
+  text: string,
+  categories: string,
+  invocation?: CustomFunctions.CancelableInvocation,
+): Promise<string> {
+  return callFunction(
+    {
+      kind: 'classify',
+      prompt: '',
+      input: String(text),
+      categories: String(categories)
+        .split(',')
+        .map((c) => c.trim())
+        .filter(Boolean),
+    },
+    isInvocation(invocation) ? invocation : undefined,
+  );
 }
 
-export async function aiExtract(text: string, field: string): Promise<string> {
-  return callFunction({ kind: 'extract', prompt: String(field), input: String(text) });
+export async function aiExtract(
+  text: string,
+  field: string,
+  invocation?: CustomFunctions.CancelableInvocation,
+): Promise<string> {
+  return callFunction(
+    { kind: 'extract', prompt: String(field), input: String(text) },
+    isInvocation(invocation) ? invocation : undefined,
+  );
 }
 
-export async function aiTranslate(text: string, targetLang: string): Promise<string> {
-  return callFunction({ kind: 'translate', prompt: '', input: String(text), targetLang });
+export async function aiTranslate(
+  text: string,
+  targetLang: string,
+  invocation?: CustomFunctions.CancelableInvocation,
+): Promise<string> {
+  return callFunction(
+    { kind: 'translate', prompt: '', input: String(text), targetLang },
+    isInvocation(invocation) ? invocation : undefined,
+  );
 }
 
 /* global CustomFunctions */

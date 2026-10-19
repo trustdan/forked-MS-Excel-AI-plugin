@@ -208,4 +208,83 @@ describe('agent loop (full integration against the emulator)', () => {
     });
     expect(provider.requests.length).toBe(5);
   });
+
+  it('aborts cleanly when abortSignal is triggered during provider chat', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+
+    const provider: ScriptedProvider = new (class extends ScriptedProvider {
+      constructor() {
+        super([]);
+      }
+      override async chat(): Promise<never> {
+        controller.abort();
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+    })();
+
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Test.xlsx',
+      history: [],
+      userMessage: 'stop me',
+      abortSignal: controller.signal,
+      onEvent: (ev) => events.push(ev),
+    });
+
+    expect(events.some((e) => e.kind === 'stopped')).toBe(true);
+    expect(result.stagedChangeSetId).toBeUndefined();
+    expect(result.history).toEqual([]);
+  });
+
+  it('aborts cleanly and skips staging when abortSignal triggers during tool calls', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: { range: 'Sheet1!A1', cells: [[42]], reason: 'should not stage' },
+          },
+        ],
+      },
+    ]);
+
+    // Abort right before or after the first tool execution
+    const origGetCell = wb.readRange.bind(wb);
+    wb.readRange = async (range: string) => {
+      controller.abort();
+      return origGetCell(range);
+    };
+
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Test.xlsx',
+      history: [],
+      userMessage: 'write and cancel',
+      abortSignal: controller.signal,
+      onEvent: (ev) => {
+        events.push(ev);
+        if (ev.kind === 'tool_use') {
+          controller.abort();
+        }
+      },
+    });
+
+    expect(events.some((e) => e.kind === 'stopped')).toBe(true);
+    expect(result.stagedChangeSetId).toBeUndefined();
+  });
 });
+
