@@ -243,30 +243,33 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
   });
 }
 
-const EDGE_MAP: Record<string, Excel.BorderIndex[]> = {
-  top: [Excel.BorderIndex.edgeTop],
-  bottom: [Excel.BorderIndex.edgeBottom],
-  left: [Excel.BorderIndex.edgeLeft],
-  right: [Excel.BorderIndex.edgeRight],
-  insideHorizontal: [Excel.BorderIndex.insideHorizontal],
-  insideVertical: [Excel.BorderIndex.insideVertical],
-  outline: [
-    Excel.BorderIndex.edgeTop,
-    Excel.BorderIndex.edgeBottom,
-    Excel.BorderIndex.edgeLeft,
-    Excel.BorderIndex.edgeRight,
-  ],
-  all: [
-    Excel.BorderIndex.edgeTop,
-    Excel.BorderIndex.edgeBottom,
-    Excel.BorderIndex.edgeLeft,
-    Excel.BorderIndex.edgeRight,
-    Excel.BorderIndex.insideHorizontal,
-    Excel.BorderIndex.insideVertical,
-  ],
-};
+function getEdgeMap(): Record<string, Excel.BorderIndex[]> {
+  return {
+    top: [Excel.BorderIndex.edgeTop],
+    bottom: [Excel.BorderIndex.edgeBottom],
+    left: [Excel.BorderIndex.edgeLeft],
+    right: [Excel.BorderIndex.edgeRight],
+    insideHorizontal: [Excel.BorderIndex.insideHorizontal],
+    insideVertical: [Excel.BorderIndex.insideVertical],
+    outline: [
+      Excel.BorderIndex.edgeTop,
+      Excel.BorderIndex.edgeBottom,
+      Excel.BorderIndex.edgeLeft,
+      Excel.BorderIndex.edgeRight,
+    ],
+    all: [
+      Excel.BorderIndex.edgeTop,
+      Excel.BorderIndex.edgeBottom,
+      Excel.BorderIndex.edgeLeft,
+      Excel.BorderIndex.edgeRight,
+      Excel.BorderIndex.insideHorizontal,
+      Excel.BorderIndex.insideVertical,
+    ],
+  };
+}
 
 function applyBorders(range: Excel.Range, border: BorderFormat): void {
+  const edgeMap = getEdgeMap();
   const style =
     border.style === 'double' ? Excel.BorderLineStyle.double : Excel.BorderLineStyle.continuous;
   const weight =
@@ -276,7 +279,7 @@ function applyBorders(range: Excel.Range, border: BorderFormat): void {
         ? Excel.BorderWeight.medium
         : Excel.BorderWeight.thin;
   const indexes = new Set<Excel.BorderIndex>();
-  for (const edge of border.edges) for (const idx of EDGE_MAP[edge] ?? []) indexes.add(idx);
+  for (const edge of border.edges) for (const idx of edgeMap[edge] ?? []) indexes.add(idx);
   for (const idx of indexes) {
     const b = range.format.borders.getItem(idx);
     b.style = style;
