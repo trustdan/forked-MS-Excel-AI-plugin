@@ -6,6 +6,7 @@ import type { WorkbookExecutor } from './workbook/executor.js';
 import type { ChatMessage, Provider } from './providers/types.js';
 import type { Ledger } from './ledger.js';
 import type { MemoryStore } from './memory/store.js';
+import type { McpManager } from './mcp/manager.js';
 
 /**
  * One session per connected workbook. Sessions are scoped by workbookId so
@@ -25,6 +26,7 @@ export class Session {
     private readonly getProvider: () => Provider,
     private readonly ledger: Ledger,
     private readonly memory: MemoryStore,
+    private readonly mcpManager?: McpManager,
   ) {
     this.changeSets = new ChangeSetManager(executor, workbookId);
   }
@@ -72,6 +74,7 @@ export class Session {
         history: this.history,
         userMessage: message + memoryNote,
         abortSignal: abortController.signal,
+        mcpManager: this.mcpManager,
         onEvent: (ev) => this.emit(ev),
         onUsage: (usage) => {
           totalIn += usage.inputTokens;

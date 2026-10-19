@@ -64,9 +64,17 @@ export class ProviderError extends Error {
 }
 
 export interface ProviderConfig {
-  kind: 'anthropic' | 'openai' | 'openai-compatible';
+  kind: 'anthropic' | 'openai' | 'openai-compatible' | 'embedded';
   model: string;
   apiKey?: string;
   /** Required for openai-compatible; defaults applied for the rest. */
   baseUrl?: string;
+  /** Optional explicit path to .gguf file for embedded engine. */
+  modelPath?: string;
+  /** Context window size in tokens for embedded engine (default: 4096). */
+  contextSize?: number;
+  /** Number of CPU threads for embedded execution. */
+  threads?: number;
+  /** Number of layers to offload to GPU if supported. */
+  gpuLayers?: number;
 }

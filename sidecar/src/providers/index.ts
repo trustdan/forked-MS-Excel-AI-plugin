@@ -1,9 +1,11 @@
 import { AnthropicProvider } from './anthropic.js';
+import { EmbeddedLlamaProvider } from './embedded.js';
 import { OpenAIProvider } from './openai.js';
 import { ProviderError, type Provider, type ProviderConfig } from './types.js';
 
 export * from './types.js';
 export { AnthropicProvider } from './anthropic.js';
+export { EmbeddedLlamaProvider, listLocalGgufModels, resolveModelPath, getModelsDir, MockLlamaBackend } from './embedded.js';
 export { OpenAIProvider } from './openai.js';
 export { ScriptedProvider, type ScriptedTurn } from './scripted.js';
 
@@ -19,6 +21,9 @@ export function createProvider(config: ProviderConfig): Provider {
     }
     case 'openai-compatible': {
       return new OpenAIProvider(config.model, apiKey, baseUrl, 'openai-compatible');
+    }
+    case 'embedded': {
+      return new EmbeddedLlamaProvider(config);
     }
   }
 }

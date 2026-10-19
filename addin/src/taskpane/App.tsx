@@ -24,8 +24,9 @@ import {
 import type { ChatItem, ProviderList } from './types.js';
 import { PairingScreen } from './components/pairing/PairingScreen.js';
 import { ModelsScreen } from './components/settings/ModelsScreen.js';
+import { McpScreen } from './components/settings/McpScreen.js';
 import { ChatBubble } from './components/chat/ChatBubble.js';
-import { Composer } from './components/chat/Composer.js';
+import { Composer, type AttachedFile } from './components/chat/Composer.js';
 
 export function App(): JSX.Element {
   const [paired, setPaired] = useState<boolean>(() => getToken() !== null);
@@ -36,10 +37,12 @@ export function App(): JSX.Element {
   const [busy, setBusy] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'models' | 'mcp'>('models');
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [activeModel, setActiveModel] = useState<string | null>(null);
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
   const [attachSelection, setAttachSelection] = useState<boolean>(true);
+  const [attachedFile, setAttachedFile] = useState<AttachedFile | null>(null);
   const [themePref, setThemePref] = useState<ThemePreference>(() => getStoredThemePreference());
   const connection = useRef<SidecarConnection | null>(null);
   const chatRef = useRef<HTMLElement | null>(null);
@@ -200,16 +203,23 @@ export function App(): JSX.Element {
     const text = input.trim();
     if (!text || busy || status !== 'connected') return;
 
-    const hasAttachment = attachSelection && selection;
-    const displayText = hasAttachment
-      ? `[📎 Selection: ${selection.address}]\n${text}`
-      : text;
-    const payloadText = hasAttachment
-      ? `[Context: Active Selection is ${selection.address} (${selection.cellCount} cells)]\n${text}`
-      : text;
+    const hasSelection = attachSelection && selection;
+    let displayText = text;
+    let payloadText = text;
+
+    if (attachedFile) {
+      displayText = `[📄 Attached File: ${attachedFile.name}]\n${displayText}`;
+      payloadText = `[Attached Document: ${attachedFile.name}]\n\`\`\`\n${attachedFile.content}\n\`\`\`\n\n${payloadText}`;
+    }
+
+    if (hasSelection) {
+      displayText = `[📎 Selection: ${selection.address}]\n${displayText}`;
+      payloadText = `[Context: Active Selection is ${selection.address} (${selection.cellCount} cells)]\n${payloadText}`;
+    }
 
     setItems((prev) => [...prev, { kind: 'user', text: displayText }]);
     setInput('');
+    setAttachedFile(null);
     setBusy(true);
     setStopping(false);
     connection.current?.sendChat(payloadText);
@@ -271,7 +281,40 @@ export function App(): JSX.Element {
       )}
 
       {showSettings ? (
-        <ModelsScreen onChanged={refreshActiveModel} />
+        <div className="settings-container">
+          <div
+            className="settings-tabs"
+            style={{
+              display: 'flex',
+              gap: '4px',
+              padding: '8px 16px',
+              borderBottom: '1px solid var(--border)',
+              background: 'var(--bg-card)',
+            }}
+          >
+            <button
+              type="button"
+              className={settingsTab === 'models' ? 'primary' : 'ghost'}
+              onClick={() => setSettingsTab('models')}
+              style={{ fontSize: '0.85em', padding: '4px 10px' }}
+            >
+              Models
+            </button>
+            <button
+              type="button"
+              className={settingsTab === 'mcp' ? 'primary' : 'ghost'}
+              onClick={() => setSettingsTab('mcp')}
+              style={{ fontSize: '0.85em', padding: '4px 10px' }}
+            >
+              MCP Connectors
+            </button>
+          </div>
+          {settingsTab === 'models' ? (
+            <ModelsScreen onChanged={refreshActiveModel} />
+          ) : (
+            <McpScreen />
+          )}
+        </div>
       ) : (
         <>
           <main className="chat" ref={chatRef}>
@@ -312,6 +355,8 @@ export function App(): JSX.Element {
             selection={selection}
             attachSelection={attachSelection}
             setAttachSelection={setAttachSelection}
+            attachedFile={attachedFile}
+            setAttachedFile={setAttachedFile}
             onSendMessage={sendMessage}
             onStopGeneration={stopGeneration}
           />

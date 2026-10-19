@@ -13,7 +13,7 @@ export type ChatItem =
       status: 'staged' | 'applied' | 'rejected' | 'undone';
     };
 
-export type ProviderKind = 'anthropic' | 'openai' | 'openai-compatible';
+export type ProviderKind = 'anthropic' | 'openai' | 'openai-compatible' | 'embedded';
 
 export interface SavedProvider {
   id: string;
@@ -22,6 +22,7 @@ export interface SavedProvider {
   baseUrl?: string;
   /** masked, presence means a key is stored */
   apiKey?: string;
+  modelPath?: string;
 }
 
 export interface ProviderList {
@@ -33,4 +34,5 @@ export const KIND_LABELS: Record<ProviderKind, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   'openai-compatible': 'OpenAI-compatible (Ollama, LM Studio, …)',
+  embedded: 'Embedded GGUF (In-Process node-llama-cpp)',
 };

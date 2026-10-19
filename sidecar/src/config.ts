@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ProviderConfig } from './providers/types.js';
+import type { McpServerConfig } from '@excelai/shared';
 
 /** A saved model configuration the user can switch between. */
 export interface StoredProvider extends ProviderConfig {
@@ -12,11 +13,15 @@ export interface StoredProvider extends ProviderConfig {
 export interface Settings {
   providers: StoredProvider[];
   activeProviderId: string | null;
+  mcpServers: McpServerConfig[];
+  approvedPaths: string[];
 }
 
 interface RawSettingsFile {
   providers?: StoredProvider[];
   activeProviderId?: string | null;
+  mcpServers?: McpServerConfig[];
+  approvedPaths?: string[];
   /** Legacy single-provider shape (pre model-list). */
   provider?: ProviderConfig;
 }
@@ -36,17 +41,22 @@ const SETTINGS_FILE = 'settings.json';
  */
 export function loadSettings(): Settings {
   const file = join(dataDir(), SETTINGS_FILE);
-  if (!existsSync(file)) return { providers: [], activeProviderId: null };
+  if (!existsSync(file)) return { providers: [], activeProviderId: null, mcpServers: [], approvedPaths: [] };
   let raw: RawSettingsFile;
   try {
     raw = JSON.parse(readFileSync(file, 'utf8')) as RawSettingsFile;
   } catch {
-    return { providers: [], activeProviderId: null };
+    return { providers: [], activeProviderId: null, mcpServers: [], approvedPaths: [] };
   }
   // Migrate the legacy single-provider shape.
   if (!raw.providers && raw.provider) {
     const migrated: StoredProvider = { ...raw.provider, id: randomUUID() };
-    const settings: Settings = { providers: [migrated], activeProviderId: migrated.id };
+    const settings: Settings = {
+      providers: [migrated],
+      activeProviderId: migrated.id,
+      mcpServers: raw.mcpServers ?? [],
+      approvedPaths: raw.approvedPaths ?? [],
+    };
     saveSettings(settings);
     return settings;
   }
@@ -55,7 +65,9 @@ export function loadSettings(): Settings {
     raw.activeProviderId && providers.some((p) => p.id === raw.activeProviderId)
       ? raw.activeProviderId
       : (providers[0]?.id ?? null);
-  return { providers, activeProviderId };
+  const mcpServers = raw.mcpServers ?? [];
+  const approvedPaths = raw.approvedPaths ?? [];
+  return { providers, activeProviderId, mcpServers, approvedPaths };
 }
 
 export function saveSettings(settings: Settings): void {
@@ -75,11 +87,13 @@ export interface RedactedProvider {
   baseUrl?: string;
   /** Masked: present only to show that a key is stored. */
   apiKey?: string;
+  modelPath?: string;
 }
 
 export function redactProvider(p: StoredProvider): RedactedProvider {
   const out: RedactedProvider = { id: p.id, kind: p.kind, model: p.model };
   if (p.baseUrl) out.baseUrl = p.baseUrl;
   if (p.apiKey) out.apiKey = `••••${p.apiKey.slice(-4)}`;
+  if (p.modelPath) out.modelPath = p.modelPath;
   return out;
 }

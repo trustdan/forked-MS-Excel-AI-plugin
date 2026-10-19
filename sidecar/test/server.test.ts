@@ -154,5 +154,42 @@ describe('sidecar HTTP API', () => {
 
     ws.close();
   });
+
+  it('lists models and saves embedded provider configuration', async () => {
+    const { base, token } = await boot();
+    const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+
+    // 1. List embedded models
+    const listRes = await fetch(`${base}/api/providers/models`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ kind: 'embedded' }),
+    });
+    expect(listRes.status).toBe(200);
+    const listData = (await listRes.json()) as { models: string[]; error?: string };
+    expect(Array.isArray(listData.models)).toBe(true);
+
+    // 2. Save embedded provider configuration
+    const saveRes = await fetch(`${base}/api/settings/providers`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({
+        kind: 'embedded',
+        model: 'qwen2.5-7b-instruct-q4_k_m.gguf',
+        contextSize: 4096,
+        threads: 4,
+      }),
+    });
+    expect(saveRes.status).toBe(200);
+    const saveData = (await saveRes.json()) as { id: string; activeProviderId: string };
+    expect(saveData.id).toBeDefined();
+
+    // 3. Verify in provider settings list
+    const getRes = await fetch(`${base}/api/settings/providers`, { headers: auth });
+    const getData = (await getRes.json()) as { providers: { kind: string; model: string }[] };
+    const embedded = getData.providers.find((p) => p.model === 'qwen2.5-7b-instruct-q4_k_m.gguf');
+    expect(embedded).toBeDefined();
+    expect(embedded?.kind).toBe('embedded');
+  });
 });
 

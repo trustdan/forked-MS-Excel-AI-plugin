@@ -209,6 +209,20 @@ export const toolSchemas = {
       .strict(),
     readonly: false,
   },
+  import_local_data: {
+    description:
+      'Parse a local CSV, TSV, JSON, or Markdown file and stage its tabular data into an Excel sheet. Staged into the change-set for user review.',
+    parameters: z
+      .object({
+        filePath: z.string().min(1).describe('Absolute path or filename of the CSV/TSV/Markdown file to import'),
+        targetSheet: z.string().min(1).optional().describe('Target sheet name (defaults to active sheet)'),
+        startCell: z.string().optional().describe('Top-left cell address (e.g. "A1", defaults to "A1")'),
+        hasHeaders: z.boolean().optional().describe('Whether the first row is a header (defaults to true)'),
+        reason: z.string().min(1).max(300).describe('One line: why this data is being imported'),
+      })
+      .strict(),
+    readonly: false,
+  },
 } as const;
 
 export type ToolName = keyof typeof toolSchemas;

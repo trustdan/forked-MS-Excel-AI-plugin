@@ -61,12 +61,27 @@ This backlog tracks the architectural, security, testing, and feature tasks for 
 ## Epic 4: Advanced Excel Agent Features & Model Connectivity (Future)
 **Goal:** Deepen Excel analysis capabilities while retaining 100% local privacy.
 
-- [ ] **FEAT-01 (P2): Embedded In-Process LLM Engine (`node-llama-cpp`)**
-  - Support direct in-process GGUF model execution in the sidecar with zero external server requirement.
-- [ ] **FEAT-02 (P2): Local Document Importer (MarkItDown / Docling)**
-  - Local conversion of PDF/Word/images into markdown tables without sending bytes to third parties.
-- [ ] **FEAT-03 (P3): Model Context Protocol (MCP) Local Connectors**
-  - Support local SQLite, local CSV directory, and filesystem MCP servers restricted to explicit user-approved paths.
+- [x] **FEAT-01 (P2): Embedded In-Process LLM Engine (`node-llama-cpp`)** 🟢
+  - Implemented `EmbeddedLlamaProvider` (`sidecar/src/providers/embedded.ts`) with dynamic optional `node-llama-cpp` loading and deterministic `MockLlamaBackend` for automated test suites.
+  - Added secure model resolution with path traversal guards (`resolveModelPath`) and automatic local GGUF discovery (`listLocalGgufModels`) in `~/.excelai/models/`.
+  - Added prompt formatting for local quantized models (Qwen 2.5 / Llama 3.1) with JSON schema tool definitions and regex/markdown tool-call extraction (`extractToolCalls`).
+  - Added AbortSignal cancellation and thread/context size bounding for in-process execution.
+  - Added "Embedded GGUF" selector in taskpane settings with "Scan local models" trigger and full unit test coverage.
+- [x] **FEAT-02 (P2): Local Document Importer (CSV / TSV / Markdown / JSON)** 🟢
+  - Implemented pure TypeScript zero-telemetry tabular parser (`sidecar/src/importers/tabular.ts`) supporting RFC 4180 CSV, TSV, Markdown tables, and JSON arrays.
+  - Added formula injection defense (CWE-1236) escaping leading formula triggers (`=`, `@`, `+`, `-`) in untrusted text cells while preserving valid signed numbers.
+  - Added `import_local_data` tool in `shared/src/tools.ts` and `sidecar/src/agent/loop.ts` staging `write_range` change-sets with optional header formatting and preview.
+  - Added `/api/importer/parse` endpoint for local file inspection and table preview.
+  - Added file attachment picker (📎) and file chip in `addin/src/taskpane/components/chat/Composer.tsx` with full unit test coverage.
+- [x] **FEAT-03 (P3): Model Context Protocol (MCP) Local Connectors** 🟢
+  - Implemented strict sandboxing validator `PathGuard` (`sidecar/src/mcp/pathGuard.ts`) restricting all filesystem, database, and CSV access to explicit user-approved paths, with path canonicalization and directory traversal prevention.
+  - Implemented built-in read-only SQLite connector (`sidecar/src/mcp/connectors/sqliteConnector.ts`) with `sqlite_list_tables`, `sqlite_describe_table`, read-only `sqlite_read_query` (blocking mutation statements), and `sqlite_stage_table_to_sheet` for staging queries directly into worksheet change-sets.
+  - Implemented built-in CSV Directory connector (`sidecar/src/mcp/connectors/csvDirectoryConnector.ts`) with `csv_list_files`, `csv_read_preview`, `csv_query`, and `csv_stage_to_sheet`.
+  - Implemented built-in Filesystem connector (`sidecar/src/mcp/connectors/filesystemConnector.ts`) with `fs_list_directory`, `fs_read_file` (with binary rejection), `fs_search_files`, and `fs_get_metadata`.
+  - Implemented standard JSON-RPC 2.0 stdio MCP client (`sidecar/src/mcp/transports/stdioTransport.ts`) supporting arbitrary external local MCP servers with protocol handshake, tool discovery, execution, lifecycle cleanup, and AbortSignal cancellation.
+  - Built centralized `McpManager` (`sidecar/src/mcp/manager.ts`) coordinating server connections, dynamic tool spec exposure to LLMs, prompt-injection defense with untrusted data wrappers, and testing.
+  - Added HTTP management endpoints (`/api/mcp/paths`, `/api/mcp/servers`, `/api/mcp/servers/test`, `/api/mcp/tools`) and taskpane settings UI tab (`addin/src/taskpane/components/settings/McpScreen.tsx`) for managing approved paths and connectors.
+  - Added comprehensive test suites across path guarding, SQLite, CSV, filesystem, stdio protocol, manager, API endpoints, agent loop turns, and React UI components.
 
 ---
 

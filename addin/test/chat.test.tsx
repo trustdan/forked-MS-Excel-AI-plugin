@@ -165,5 +165,30 @@ describe('Chat Components', () => {
       fireEvent.click(chip);
       expect(setAttachSelection).toHaveBeenCalled();
     });
+
+    it('renders attached file chip and allows detaching file', () => {
+      const setAttachedFile = vi.fn();
+      render(
+        <Composer
+          input=""
+          setInput={() => {}}
+          busy={false}
+          stopping={false}
+          status="connected"
+          selection={null}
+          attachSelection={false}
+          setAttachSelection={() => {}}
+          attachedFile={{ name: 'revenue.csv', size: 1024, content: 'a,b\n1,2' }}
+          setAttachedFile={setAttachedFile}
+          onSendMessage={() => {}}
+          onStopGeneration={() => {}}
+        />,
+      );
+
+      expect(screen.getByText('revenue.csv')).toBeDefined();
+      const detachBtn = screen.getByRole('button', { name: /Detach file/i });
+      fireEvent.click(detachBtn);
+      expect(setAttachedFile).toHaveBeenCalledWith(null);
+    });
   });
 });

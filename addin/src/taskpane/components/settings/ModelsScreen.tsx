@@ -181,14 +181,25 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
               value={form.kind}
               onChange={(e) => {
                 setSuggestions([]);
-                setForm({ ...form, kind: e.target.value as ProviderKind });
+                const nextKind = e.target.value as ProviderKind;
+                setForm({
+                  ...form,
+                  kind: nextKind,
+                  model: nextKind === 'embedded' ? (form.model || '') : form.model,
+                });
               }}
             >
               <option value="openai-compatible">OpenAI-compatible (LM Studio, Ollama, …)</option>
+              <option value="embedded">Embedded GGUF (In-Process node-llama-cpp)</option>
               <option value="openai">OpenAI</option>
               <option value="anthropic">Anthropic</option>
             </select>
           </label>
+          {form.kind === 'embedded' && (
+            <div className="hint" style={{ marginBottom: '10px' }}>
+              💡 Runs completely in-process. Place your <code>.gguf</code> model files in <code>~/.excelai/models/</code> and click <em>Scan local models</em>.
+            </div>
+          )}
           {form.kind === 'openai-compatible' && (
             <>
               <label>
@@ -226,21 +237,29 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
               </div>
             </>
           )}
+          {form.kind !== 'embedded' && (
+            <label>
+              API key {form.kind === 'openai-compatible' && <em>(optional)</em>}
+              <input
+                type="password"
+                value={form.apiKey}
+                placeholder="stored locally by the sidecar, never sent elsewhere"
+                onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
+              />
+            </label>
+          )}
           <label>
-            API key {form.kind === 'openai-compatible' && <em>(optional)</em>}
-            <input
-              type="password"
-              value={form.apiKey}
-              placeholder="stored locally by the sidecar, never sent elsewhere"
-              onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
-            />
-          </label>
-          <label>
-            Model
+            Model {form.kind === 'embedded' ? '(.gguf filename)' : ''}
             <input
               value={form.model}
               list="model-suggestions"
-              placeholder={form.kind === 'openai-compatible' ? 'llama3.1' : 'model id'}
+              placeholder={
+                form.kind === 'embedded'
+                  ? 'qwen2.5-7b-instruct-q4_k_m.gguf'
+                  : form.kind === 'openai-compatible'
+                    ? 'llama3.1'
+                    : 'model id'
+              }
               onChange={(e) => setForm({ ...form, model: e.target.value })}
             />
             <datalist id="model-suggestions">
@@ -253,9 +272,16 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
             <button
               className="ghost"
               onClick={loadModels}
-              disabled={busyAction !== '' || (form.kind !== 'openai' && form.kind !== 'anthropic' && !form.baseUrl)}
+              disabled={
+                busyAction !== '' ||
+                (form.kind !== 'embedded' && form.kind !== 'openai' && form.kind !== 'anthropic' && !form.baseUrl)
+              }
             >
-              {busyAction === 'models' ? 'Fetching…' : 'List available models'}
+              {busyAction === 'models'
+                ? 'Fetching…'
+                : form.kind === 'embedded'
+                  ? 'Scan local models'
+                  : 'List available models'}
             </button>
             <button className="ghost" onClick={testCandidate} disabled={!form.model || busyAction !== ''}>
               {busyAction === 'test' ? 'Testing…' : 'Test'}

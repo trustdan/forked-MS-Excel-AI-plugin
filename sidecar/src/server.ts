@@ -2,8 +2,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createServer as createHttpsServer } from 'node:https';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { PROTOCOL_VERSION, type ClientMessage } from '@excelai/shared';
+import { PROTOCOL_VERSION, type ClientMessage, type McpServerConfig } from '@excelai/shared';
 import { z } from 'zod';
 import { Auth } from './auth.js';
 import {
@@ -17,10 +18,12 @@ import type { Db } from './db.js';
 import { Ledger } from './ledger.js';
 import { MemoryStore } from './memory/store.js';
 import { FunctionEngine } from './functions/batch.js';
-import { createProvider, ProviderError, type Provider } from './providers/index.js';
+import { createProvider, ProviderError, getModelsDir, listLocalGgufModels, type Provider } from './providers/index.js';
 import { BridgeExecutor } from './bridge.js';
 import { Session } from './session.js';
 import { assertLoopbackUrl } from './networkGuard.js';
+import { loadAndParseLocalFile, parseTabularContent } from './importers/tabular.js';
+import { McpManager, PathGuard } from './mcp/index.js';
 
 const SIDECAR_VERSION = '0.1.0';
 
@@ -36,7 +39,7 @@ export interface SidecarServer {
 }
 
 const providerConfigSchema = z.object({
-  kind: z.enum(['anthropic', 'openai', 'openai-compatible']),
+  kind: z.enum(['anthropic', 'openai', 'openai-compatible', 'embedded']),
   model: z.string().min(1),
   apiKey: z.string().min(1).optional(),
   baseUrl: z
@@ -55,6 +58,23 @@ const providerConfigSchema = z.object({
       },
       { message: 'baseUrl must be a local loopback address (127.0.0.1, localhost, [::1])' },
     ),
+  modelPath: z.string().optional(),
+  contextSize: z.number().int().positive().optional(),
+  threads: z.number().int().positive().optional(),
+  gpuLayers: z.number().int().min(0).optional(),
+});
+
+const mcpServerConfigSchema = z.object({
+  id: z.string().optional(),
+  name: z.string().min(1),
+  enabled: z.boolean().default(true),
+  transport: z.enum(['builtin', 'stdio']),
+  type: z.enum(['sqlite', 'csv-directory', 'filesystem']).optional(),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
+  env: z.record(z.string()).optional(),
+  allowedPaths: z.array(z.string()).default([]),
+  options: z.record(z.unknown()).optional(),
 });
 
 export async function startServer(options: {
@@ -67,6 +87,10 @@ export async function startServer(options: {
   const ledger = new Ledger(db);
   const memory = new MemoryStore(db);
   const functions = new FunctionEngine(db);
+  const mcpManager = new McpManager();
+
+  const initialSettings = loadSettings();
+  await mcpManager.sync(initialSettings.mcpServers, initialSettings.approvedPaths);
 
   let cachedProvider: { provider: Provider; fingerprint: string } | null = null;
   const getProvider = (): Provider => {
@@ -227,7 +251,7 @@ export async function startServer(options: {
        *  readiness check: lists the models actually installed). */
       if (url.pathname === '/api/providers/models' && req.method === 'POST') {
         const schema = z.object({
-          kind: z.enum(['anthropic', 'openai', 'openai-compatible']),
+          kind: z.enum(['anthropic', 'openai', 'openai-compatible', 'embedded']),
           apiKey: z.string().optional(),
           baseUrl: z
             .string()
@@ -297,6 +321,50 @@ export async function startServer(options: {
         }
         return;
       }
+      if (url.pathname === '/api/importer/parse' && req.method === 'POST') {
+        const schema = z
+          .object({
+            filePath: z.string().optional(),
+            content: z.string().optional(),
+            format: z.enum(['csv', 'tsv', 'markdown', 'json', 'auto']).optional(),
+          })
+          .refine((d) => d.filePath || d.content, {
+            message: 'Either filePath or content must be provided',
+          });
+        const parsed = schema.safeParse(await readJson(req));
+        if (!parsed.success) {
+          sendJson(res, 400, { ok: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+          return;
+        }
+        try {
+          if (parsed.data.filePath) {
+            const result = loadAndParseLocalFile(parsed.data.filePath);
+            const headers = result.rows[0]?.map((c) => String(c ?? '')) ?? [];
+            sendJson(res, 200, {
+              ok: true,
+              format: result.format,
+              totalRows: result.totalRows,
+              totalCols: result.totalCols,
+              headers,
+              previewRows: result.rows.slice(0, 10),
+            });
+          } else if (parsed.data.content) {
+            const rows = parseTabularContent(parsed.data.content, parsed.data.format);
+            const headers = rows[0]?.map((c) => String(c ?? '')) ?? [];
+            sendJson(res, 200, {
+              ok: true,
+              format: parsed.data.format ?? 'auto',
+              totalRows: rows.length,
+              totalCols: rows[0]?.length ?? 0,
+              headers,
+              previewRows: rows.slice(0, 10),
+            });
+          }
+        } catch (e) {
+          sendJson(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
+        return;
+      }
       if (url.pathname === '/api/ledger/summary' && req.method === 'GET') {
         sendJson(res, 200, ledger.summary());
         return;
@@ -314,6 +382,127 @@ export async function startServer(options: {
           return;
         }
         sendJson(res, 200, memory.add(parsed.data.scope, parsed.data.content));
+        return;
+      }
+
+      /* ----- Model Context Protocol (MCP) ----- */
+
+      if (url.pathname === '/api/mcp/servers' && req.method === 'GET') {
+        const settings = loadSettings();
+        sendJson(res, 200, {
+          servers: mcpManager.getServerStatuses(settings.mcpServers),
+        });
+        return;
+      }
+
+      if (url.pathname === '/api/mcp/servers' && req.method === 'POST') {
+        const parsed = mcpServerConfigSchema.safeParse(await readJson(req));
+        if (!parsed.success) {
+          sendJson(res, 400, { ok: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+          return;
+        }
+        const settings = loadSettings();
+        const serverData: McpServerConfig = {
+          ...parsed.data,
+          id: parsed.data.id || randomUUID(),
+        };
+        const idx = settings.mcpServers.findIndex((s) => s.id === serverData.id);
+        if (idx >= 0) {
+          settings.mcpServers[idx] = serverData;
+        } else {
+          settings.mcpServers.push(serverData);
+        }
+        saveSettings(settings);
+        await mcpManager.sync(settings.mcpServers, settings.approvedPaths);
+        sendJson(res, 200, { ok: true, server: serverData });
+        return;
+      }
+
+      const mcpServerToggleMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/toggle$/);
+      if (mcpServerToggleMatch && req.method === 'POST') {
+        const serverId = mcpServerToggleMatch[1];
+        const settings = loadSettings();
+        const server = settings.mcpServers.find((s) => s.id === serverId);
+        if (!server) {
+          sendJson(res, 404, { ok: false, error: 'MCP Server not found' });
+          return;
+        }
+        server.enabled = !server.enabled;
+        saveSettings(settings);
+        await mcpManager.sync(settings.mcpServers, settings.approvedPaths);
+        sendJson(res, 200, { ok: true, enabled: server.enabled });
+        return;
+      }
+
+      const mcpServerDeleteMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)$/);
+      if (mcpServerDeleteMatch && req.method === 'DELETE') {
+        const serverId = mcpServerDeleteMatch[1];
+        const settings = loadSettings();
+        settings.mcpServers = settings.mcpServers.filter((s) => s.id !== serverId);
+        saveSettings(settings);
+        await mcpManager.sync(settings.mcpServers, settings.approvedPaths);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/mcp/servers/test' && req.method === 'POST') {
+        const parsed = mcpServerConfigSchema.safeParse(await readJson(req));
+        if (!parsed.success) {
+          sendJson(res, 400, { ok: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+          return;
+        }
+        const settings = loadSettings();
+        const testRes = await mcpManager.testServer(
+          { ...parsed.data, id: parsed.data.id || 'test-temp' },
+          settings.approvedPaths,
+        );
+        sendJson(res, 200, testRes);
+        return;
+      }
+
+      if (url.pathname === '/api/mcp/paths' && req.method === 'GET') {
+        const settings = loadSettings();
+        sendJson(res, 200, { paths: settings.approvedPaths });
+        return;
+      }
+
+      if (url.pathname === '/api/mcp/paths' && req.method === 'POST') {
+        const body = (await readJson(req)) as { path?: string };
+        const rawPath = typeof body?.path === 'string' ? body.path.trim() : '';
+        if (!rawPath) {
+          sendJson(res, 400, { ok: false, error: 'Path is required' });
+          return;
+        }
+        let canonical: string;
+        try {
+          canonical = PathGuard.canonicalize(rawPath);
+        } catch (e) {
+          sendJson(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
+          return;
+        }
+        const settings = loadSettings();
+        if (!settings.approvedPaths.includes(canonical)) {
+          settings.approvedPaths.push(canonical);
+          saveSettings(settings);
+          await mcpManager.sync(settings.mcpServers, settings.approvedPaths);
+        }
+        sendJson(res, 200, { ok: true, paths: settings.approvedPaths });
+        return;
+      }
+
+      if (url.pathname === '/api/mcp/paths' && req.method === 'DELETE') {
+        const body = (await readJson(req)) as { path?: string };
+        const rawPath = typeof body?.path === 'string' ? body.path.trim() : '';
+        const settings = loadSettings();
+        settings.approvedPaths = settings.approvedPaths.filter((p) => p !== rawPath);
+        saveSettings(settings);
+        await mcpManager.sync(settings.mcpServers, settings.approvedPaths);
+        sendJson(res, 200, { ok: true, paths: settings.approvedPaths });
+        return;
+      }
+
+      if (url.pathname === '/api/mcp/tools' && req.method === 'GET') {
+        sendJson(res, 200, { tools: mcpManager.getToolSpecs() });
         return;
       }
       sendJson(res, 404, { error: 'Not found' });
@@ -389,6 +578,7 @@ export async function startServer(options: {
               getProvider,
               ledger,
               memory,
+              mcpManager,
             );
             ws.send(
               JSON.stringify({
@@ -439,11 +629,13 @@ export async function startServer(options: {
     server,
     auth,
     port: actualPort,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
-        wss.close();
+    close: async () => {
+      await mcpManager.closeAll();
+      wss.close();
+      await new Promise<void>((resolve, reject) => {
         server.close((e) => (e ? reject(e) : resolve()));
-      }),
+      });
+    },
   };
 }
 
@@ -484,10 +676,20 @@ async function testProviderConfig(
 }
 
 async function listModels(config: {
-  kind: 'anthropic' | 'openai' | 'openai-compatible';
+  kind: 'anthropic' | 'openai' | 'openai-compatible' | 'embedded';
   apiKey?: string;
   baseUrl?: string;
 }): Promise<{ models: string[]; error?: string }> {
+  if (config.kind === 'embedded') {
+    const models = await listLocalGgufModels();
+    if (models.length === 0) {
+      return {
+        models: [],
+        error: `No .gguf models found in "${getModelsDir()}". Place GGUF model files there to run in-process.`,
+      };
+    }
+    return { models };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8_000);
   try {

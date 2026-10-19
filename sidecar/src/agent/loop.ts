@@ -13,6 +13,8 @@ import { withRetry } from '../providers/index.js';
 import type { WorkbookExecutor } from '../workbook/executor.js';
 import type { ChangeSetManager } from '../changeset/manager.js';
 import { buildSystemPrompt, emulatedToolInstructions } from './prompts.js';
+import { generateImportChangeOps, loadAndParseLocalFile } from '../importers/tabular.js';
+import type { McpManager } from '../mcp/manager.js';
 
 export type AgentEvent =
   | { kind: 'text'; text: string }
@@ -32,6 +34,7 @@ export interface AgentTurnOptions {
   onUsage?: (usage: { inputTokens: number; outputTokens: number }) => void;
   maxIterations?: number;
   abortSignal?: AbortSignal;
+  mcpManager?: McpManager;
 }
 
 export interface AgentTurnResult {
@@ -72,7 +75,8 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
   } = options;
 
   let system = buildSystemPrompt(workbookName);
-  const specs = buildToolSpecs();
+  const mcpSpecs = options.mcpManager?.getToolSpecs() ?? [];
+  const specs = [...buildToolSpecs(), ...mcpSpecs];
   if (!provider.supportsTools) {
     const toolList = specs
       .map((s) => `- ${s.name}: ${s.description}\n  args schema: ${JSON.stringify(s.inputSchema)}`)
@@ -167,7 +171,15 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
       }
       let result: string;
       try {
-        result = await executeToolCall(call.name, call.argsJson, executor, pendingOps, emit);
+        result = await executeToolCall(
+          call.name,
+          call.argsJson,
+          executor,
+          pendingOps,
+          emit,
+          options.mcpManager,
+          abortSignal,
+        );
       } catch (e) {
         if (
           abortSignal?.aborted ||
@@ -223,9 +235,32 @@ async function executeToolCall(
   executor: WorkbookExecutor,
   pendingOps: ChangeOp[],
   onEvent: (ev: AgentEvent) => void,
+  mcpManager?: McpManager,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
+  if (mcpManager?.hasTool(name)) {
+    let rawArgs: Record<string, unknown> = {};
+    try {
+      rawArgs = argsJson.trim() === '' ? {} : JSON.parse(argsJson);
+    } catch {
+      return errorResult('Tool arguments were not valid JSON. Re-send the call with valid JSON arguments.');
+    }
+    const summary = JSON.stringify(rawArgs).slice(0, 100);
+    onEvent({ kind: 'tool_use', tool: name, summary });
+
+    const mcpRes = await mcpManager.callTool(name, rawArgs, { abortSignal });
+    if (mcpRes.changeOps && mcpRes.changeOps.length > 0) {
+      pendingOps.push(...mcpRes.changeOps);
+    }
+    return mcpRes.resultText;
+  }
+
   if (!(name in toolSchemas)) {
-    return errorResult(`Unknown tool "${name}". Available tools: ${Object.keys(toolSchemas).join(', ')}`);
+    const available = [
+      ...Object.keys(toolSchemas),
+      ...(mcpManager ? mcpManager.getToolSpecs().map((s) => s.name) : []),
+    ];
+    return errorResult(`Unknown tool "${name}". Available tools: ${available.join(', ')}`);
   }
   const toolName = name as ToolName;
 
@@ -249,6 +284,35 @@ async function executeToolCall(
 
   try {
     if (isWriteTool(toolName)) {
+      if (toolName === 'import_local_data') {
+        const filePath = args.filePath as string;
+        const startCell = (args.startCell as string | undefined) ?? 'A1';
+        const hasHeaders = (args.hasHeaders as boolean | undefined) ?? true;
+        const reason = (args.reason as string | undefined) ?? `Import data from ${filePath}`;
+        let targetSheet = args.targetSheet as string | undefined;
+        if (!targetSheet) {
+          const map = await executor.getWorkbookMap();
+          targetSheet = map.sheets[0]?.name ?? 'Sheet1';
+        }
+        const { rows, totalRows, totalCols, format } = loadAndParseLocalFile(filePath);
+        const ops = generateImportChangeOps({
+          rows,
+          targetSheet,
+          startCell,
+          hasHeaders,
+          reason,
+        });
+        pendingOps.push(...ops);
+        return JSON.stringify({
+          ok: true,
+          staged: true,
+          format,
+          rowsCount: totalRows,
+          colsCount: totalCols,
+          targetRange: ops[0]?.kind === 'write_range' ? ops[0].range : undefined,
+          note: `Imported ${totalRows} rows × ${totalCols} columns staged into pending change-set. Not applied yet until user approves.`,
+        });
+      }
       pendingOps.push(toChangeOp(toolName, args));
       return JSON.stringify({
         ok: true,
@@ -355,6 +419,8 @@ function toChangeOp(name: ToolName, args: Record<string, unknown>): ChangeOp {
         reason: args.reason as string,
       };
     }
+    case 'import_local_data':
+      throw new Error('import_local_data is handled asynchronously in executeToolCall');
     default:
       throw new Error(`Not a write tool: ${name}`);
   }
@@ -379,6 +445,8 @@ function summarize(name: ToolName, args: Record<string, unknown>): string {
       return `${String(args.sheet ?? '')} @${String(args.at ?? '')}×${String(args.count ?? 1)}`;
     case 'find':
       return String(args.query ?? '');
+    case 'import_local_data':
+      return String(args.filePath ?? '');
     default:
       return '';
   }
