@@ -1,9 +1,20 @@
 import type { ChangePreviewItem } from '@excelai/shared';
 
+export type ActivityStep =
+  | { kind: 'thinking'; text: string; durationMs?: number }
+  | { kind: 'tool'; text: string };
+
 export type ChatItem =
   | { kind: 'user'; text: string }
-  | { kind: 'assistant'; text: string }
+  | { kind: 'assistant'; text: string; streaming?: boolean }
   | { kind: 'tool'; text: string }
+  | { kind: 'thinking'; text: string; durationMs?: number; active?: boolean }
+  | {
+      kind: 'activity';
+      steps: ActivityStep[];
+      totalDurationMs: number;
+      active: boolean;
+    }
   | { kind: 'error'; text: string }
   | { kind: 'stopped'; text: string }
   | {

@@ -117,3 +117,43 @@ This backlog tracks the architectural, security, testing, and feature tasks for 
   - Decomposed monolithic `App.tsx` (formerly 861 lines) into modular components: `components/chat/` (`ChatBubble`, `Composer`), `components/changeset/` (`ChangeSetCard`), `components/settings/` (`ModelsScreen`), `components/pairing/` (`PairingScreen`), and shared types in `types.ts`.
   - Configured Vitest + `@testing-library/react` + `jsdom` for `addin/` with component unit tests covering pairing submission, message streaming, composer interactions (Enter, Shift+Enter, selection chip attachment, abort/stop button), and change-set review (diff inspector, approve/reject).
 
+---
+
+## Epic 6: Agent Reasoning Transparency & Live Progress Streaming
+**Goal:** Give users real-time visibility into the agent's chain-of-thought and tool-execution progress via a collapsible "Thinking / Progress" drawer (similar to Google Antigravity, Claude Code, and ChatGPT Codex), eliminating perceived freezes during long local LLM turns.
+
+### Sprint 6.1: Collapsible Thinking & Step-by-Step Progress Drawer
+**Goal:** Capture reasoning output across all model providers, emit structured thinking and step events over the WebSocket protocol, and render a collapsible progress accordion in the taskpane UI.
+
+- [x] **THK-01 (P1): Protocol & Provider Reasoning Normalization** 🟢
+  - Extend `AgentEvent` in `shared/src/protocol.ts` with `{ kind: 'thinking'; text: string; durationMs?: number }`.
+  - Normalize inline `<think>...</think>` blocks in `OpenAIProvider` (`sidecar/src/providers/openai.ts`) and `EmbeddedLlamaProvider` (`sidecar/src/providers/embedded.ts`) so models like DeepSeek R1, QwQ, and Qwen3 populate `ChatResponse.reasoning` cleanly without leaking raw `<think>` tags into `text`.
+  - Extract `{ type: 'thinking', thinking: string }` content blocks in `AnthropicProvider` (`sidecar/src/providers/anthropic.ts`).
+  - Emit `thinking` events with step elapsed time from `runAgentTurn` (`sidecar/src/agent/loop.ts`) before tool execution and assistant text replies.
+- [x] **THK-02 (P1): Collapsible Thinking & Tool Activity Drawer UI** 🟢
+  - Create `ThinkingBlock` / `ActivityDrawer` component in `addin/src/taskpane/components/chat/` grouping contiguous `thinking` and `tool_use` events within a turn into a single collapsible `<details>` timeline.
+  - Display a concise status summary header (e.g., *"Thinking… (2 steps)"* while active; *"Thought for 4.2s · 3 tool calls"* once completed).
+  - Auto-expand (or show latest step preview) while the turn is in-flight (`busy`), and auto-collapse cleanly once the assistant's final response or staged change-set arrives.
+  - Style the collapsible drawer for both Light and Dark Office themes (`addin/src/taskpane/styles.css`).
+- [x] **THK-03 (P1): Unit & Integration Tests for Thinking Events** 🟢
+  - Add provider unit tests in `sidecar/test/providers.test.ts` verifying `<think>` tag extraction, `reasoning_content` handling, and Anthropic `thinking` blocks.
+  - Add taskpane component tests in `addin/test/` verifying collapsible toggle behavior, step grouping, and auto-collapse on turn completion.
+
+### Sprint 6.2: Real-Time Token & Reasoning Streaming (SSE)
+**Goal:** Stream reasoning tokens and assistant text deltas live as the local inference server generates them, so users see immediate token-by-token progress during multi-second local LLM generations.
+
+- [x] **THK-04 (P2): WebSocket Delta Protocol & Bounded Stream Buffers** 🟢
+  - Extend `AgentEvent` in `shared/src/protocol.ts` with `{ kind: 'thinking_delta'; text: string }` and `{ kind: 'text_delta'; text: string }`.
+  - Add optional `onDelta?: (delta: { reasoning?: string; text?: string }) => void` callback to `ChatRequestOptions` in `sidecar/src/providers/types.ts`.
+  - Enforce memory caps and `AbortSignal` cleanup on streaming readers (`structural-integrity-manager` invariant).
+- [x] **THK-05 (P2): Server-Sent Events (SSE) Streaming in Providers** 🟢
+  - Implement SSE stream parsing (`stream: true`) in `OpenAIProvider` (`sidecar/src/providers/openai.ts`) handling incremental `delta.reasoning_content`, `delta.reasoning`, `delta.content` (including live `<think>` tag state machine), and chunked `delta.tool_calls` assembly.
+  - Implement SSE stream parsing in `AnthropicProvider` (`sidecar/src/providers/anthropic.ts`) for `content_block_delta` (`thinking_delta`, `text_delta`, `input_json_delta`).
+  - Support token-by-token `onToken` streaming callbacks in `EmbeddedLlamaProvider` (`sidecar/src/providers/embedded.ts`).
+  - Maintain automatic fallback to non-streaming requests if a local server rejects `stream: true`.
+- [x] **THK-06 (P2): Live Streaming Taskpane Reducer & Auto-Scroll UX** 🟢
+  - Update `App.tsx` event handling to coalesce incoming `thinking_delta` and `text_delta` chunks into the active turn's state without excessive re-renders.
+  - Show a live-updating ticker of the current thought line inside the collapsible header while collapsed, or smooth auto-scroll inside the expanded drawer.
+  - Add end-to-end streaming unit tests in `sidecar/test/` and `addin/test/`.
+
+

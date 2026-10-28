@@ -49,13 +49,12 @@ export function Composer({
         size: file.size,
         content: text,
       });
-      if (!input.trim()) {
-        setInput(`Import ${file.name} starting at A1`);
-      }
     };
     reader.readAsText(file);
     e.target.value = '';
   };
+
+  const canSend = !busy && status === 'connected' && (Boolean(input.trim()) || Boolean(attachedFile));
 
   return (
     <footer>
@@ -130,7 +129,11 @@ export function Composer({
         <textarea
           value={input}
           rows={1}
-          placeholder="Ask about this sheet… (Shift+Enter for a new line)"
+          placeholder={
+            attachedFile
+              ? `Ask about ${attachedFile.name} or press Enter to use it…`
+              : 'Ask about this sheet… (Shift+Enter for a new line)'
+          }
           aria-label="Prompt input"
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
@@ -160,7 +163,7 @@ export function Composer({
             className="send"
             aria-label="Send"
             onClick={onSendMessage}
-            disabled={busy || status !== 'connected' || !input.trim()}
+            disabled={!canSend}
           >
             ↑
           </button>

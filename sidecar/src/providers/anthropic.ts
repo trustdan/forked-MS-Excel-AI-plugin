@@ -5,11 +5,18 @@ import {
   type Provider,
   type ToolCall,
 } from './types.js';
-import { assertLoopbackUrl } from '../networkGuard.js';
+import { extractThinking } from './embedded.js';
+import {
+  MAX_ACCUMULATED_TEXT_CHARS,
+  ThinkStreamSplitter,
+  readSseStream,
+} from './sse.js';
+import { assertLoopbackUrl, loopbackFetch } from '../networkGuard.js';
 
 interface AnthropicContentBlock {
   type: string;
   text?: string;
+  thinking?: string;
   id?: string;
   name?: string;
   input?: unknown;
@@ -19,6 +26,7 @@ interface AnthropicContentBlock {
 export class AnthropicProvider implements Provider {
   readonly id = 'anthropic';
   readonly supportsTools = true;
+  private sendStream = true;
 
   constructor(
     readonly model: string,
@@ -29,6 +37,37 @@ export class AnthropicProvider implements Provider {
   }
 
   async chat(options: ChatRequestOptions): Promise<ChatResponse> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const wantStream = Boolean(options.onDelta) && this.sendStream;
+      const res = await this.send(options, wantStream);
+      if (res.ok) {
+        const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+        if (wantStream && contentType.includes('text/event-stream')) {
+          return this.parseStream(res, options);
+        }
+        return this.parse(res, options);
+      }
+
+      const text = await res.text().catch(() => '');
+      if (
+        wantStream &&
+        (res.status === 400 || res.status === 404 || res.status === 405 || res.status === 422 || res.status === 501) &&
+        /stream|unsupported|not supported|invalid/i.test(text)
+      ) {
+        this.sendStream = false;
+        continue;
+      }
+
+      throw new ProviderError(
+        `Anthropic API error ${res.status}: ${truncate(text)}`,
+        res.status,
+        res.status === 429 || res.status >= 500,
+      );
+    }
+    throw new ProviderError('Anthropic: request failed after streaming fallback');
+  }
+
+  private async send(options: ChatRequestOptions, stream: boolean): Promise<Response> {
     const system = options.messages.find((m) => m.role === 'system');
     const messages: unknown[] = [];
     for (const m of options.messages) {
@@ -60,6 +99,7 @@ export class AnthropicProvider implements Provider {
       max_tokens: options.maxTokens ?? 4096,
       messages,
     };
+    if (stream) body.stream = true;
     if (system) body.system = system.content;
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.tools && options.tools.length > 0) {
@@ -73,7 +113,7 @@ export class AnthropicProvider implements Provider {
     const endpoint = `${this.baseUrl.replace(/\/$/, '')}/v1/messages`;
     assertLoopbackUrl(endpoint);
 
-    const res = await fetch(endpoint, {
+    return loopbackFetch(endpoint, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -83,16 +123,9 @@ export class AnthropicProvider implements Provider {
       body: JSON.stringify(body),
       signal: options.abortSignal ?? null,
     });
+  }
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new ProviderError(
-        `Anthropic API error ${res.status}: ${truncate(text)}`,
-        res.status,
-        res.status === 429 || res.status >= 500,
-      );
-    }
-
+  private async parse(res: Response, options: ChatRequestOptions): Promise<ChatResponse> {
     const data = (await res.json()) as {
       content: AnthropicContentBlock[];
       stop_reason: string;
@@ -100,15 +133,33 @@ export class AnthropicProvider implements Provider {
     };
 
     let text = '';
+    const reasoningParts: string[] = [];
     const toolCalls: ToolCall[] = [];
     for (const block of data.content ?? []) {
-      if (block.type === 'text' && block.text) text += block.text;
-      if (block.type === 'tool_use' && block.id && block.name) {
+      if (block.type === 'thinking') {
+        const thought = (block.thinking ?? block.text ?? '').trim();
+        if (thought) reasoningParts.push(thought);
+      } else if (block.type === 'text' && block.text) {
+        text += block.text;
+      } else if (block.type === 'tool_use' && block.id && block.name) {
         toolCalls.push({ id: block.id, name: block.name, argsJson: JSON.stringify(block.input ?? {}) });
       }
     }
 
-    return {
+    if (/<(?:think|thinking)>/i.test(text)) {
+      const extracted = extractThinking(text);
+      text = extracted.cleanText;
+      if (extracted.reasoning) reasoningParts.push(extracted.reasoning);
+    }
+
+    const reasoningText = reasoningParts.join('\n\n').trim();
+
+    if (options.onDelta) {
+      if (reasoningText) options.onDelta({ reasoning: reasoningText });
+      if (text && !/<tool_call>/i.test(text)) options.onDelta({ text });
+    }
+
+    const out: ChatResponse = {
       text,
       toolCalls,
       usage: {
@@ -124,7 +175,183 @@ export class AnthropicProvider implements Provider {
               ? 'end'
               : 'other',
     };
+    if (reasoningText.length > 0) {
+      out.reasoning = reasoningText;
+    }
+    return out;
   }
+
+  private async parseStream(res: Response, options: ChatRequestOptions): Promise<ChatResponse> {
+    let rawText = '';
+    let explicitReasoning = '';
+    let stopReason = 'end_turn';
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    const toolBlocks = new Map<number, { id: string; name: string; inputJson: string }>();
+    const splitter = new ThinkStreamSplitter(options.onDelta);
+
+    await readSseStream(
+      res,
+      (ev) => {
+        let payload: {
+          type?: string;
+          index?: number;
+          message?: {
+            stop_reason?: string | null;
+            usage?: { input_tokens?: number; output_tokens?: number };
+          };
+          content_block?: {
+            type?: string;
+            id?: string;
+            name?: string;
+            text?: string;
+            thinking?: string;
+            input?: unknown;
+          };
+          delta?: {
+            type?: string;
+            text?: string;
+            thinking?: string;
+            partial_json?: string;
+            stop_reason?: string | null;
+          };
+          usage?: { input_tokens?: number; output_tokens?: number };
+          error?: { message?: string };
+        };
+        try {
+          payload = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+
+        const eventType = payload.type ?? ev.event;
+        if (eventType === 'error' || payload.error?.message) {
+          throw new ProviderError(
+            `Anthropic stream error: ${payload.error?.message ?? 'unknown error'}`,
+          );
+        }
+
+        if (eventType === 'message_start') {
+          if (payload.message?.usage?.input_tokens !== undefined) {
+            inputTokens = payload.message.usage.input_tokens;
+          }
+          if (payload.message?.usage?.output_tokens !== undefined) {
+            outputTokens = payload.message.usage.output_tokens;
+          }
+          return;
+        }
+
+        if (eventType === 'content_block_start' && payload.content_block) {
+          const idx = payload.index ?? 0;
+          const cb = payload.content_block;
+          if (cb.type === 'tool_use' && cb.id && cb.name) {
+            const initialJson =
+              cb.input && typeof cb.input === 'object' && Object.keys(cb.input as object).length > 0
+                ? JSON.stringify(cb.input)
+                : '';
+            toolBlocks.set(idx, { id: cb.id, name: cb.name, inputJson: initialJson });
+          } else if (cb.type === 'thinking' && cb.thinking) {
+            explicitReasoning = appendBounded(explicitReasoning, cb.thinking);
+            splitter.pushReasoning(cb.thinking);
+          } else if (cb.type === 'text' && cb.text) {
+            rawText = appendBounded(rawText, cb.text);
+            splitter.pushContent(cb.text);
+          }
+          return;
+        }
+
+        if (eventType === 'content_block_delta' && payload.delta) {
+          const idx = payload.index ?? 0;
+          const d = payload.delta;
+          if (d.type === 'thinking_delta' && d.thinking) {
+            explicitReasoning = appendBounded(explicitReasoning, d.thinking);
+            splitter.pushReasoning(d.thinking);
+          } else if (d.type === 'text_delta' && d.text) {
+            rawText = appendBounded(rawText, d.text);
+            splitter.pushContent(d.text);
+          } else if (d.type === 'input_json_delta' && d.partial_json !== undefined) {
+            const entry = toolBlocks.get(idx);
+            if (entry) {
+              entry.inputJson = appendBounded(entry.inputJson, d.partial_json);
+            }
+          }
+          return;
+        }
+
+        if (eventType === 'message_delta') {
+          if (payload.delta?.stop_reason) {
+            stopReason = payload.delta.stop_reason;
+          }
+          if (payload.usage?.input_tokens !== undefined) {
+            inputTokens = payload.usage.input_tokens;
+          }
+          if (payload.usage?.output_tokens !== undefined) {
+            outputTokens = payload.usage.output_tokens;
+          }
+        }
+      },
+      { abortSignal: options.abortSignal },
+    );
+
+    splitter.flush();
+
+    const toolCalls: ToolCall[] = Array.from(toolBlocks.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([, tb]) => ({
+        id: tb.id,
+        name: tb.name,
+        argsJson: tb.inputJson.trim() ? tb.inputJson : '{}',
+      }));
+
+    let text = rawText;
+    let inlineReasoning = '';
+    if (/<(?:think|thinking)>/i.test(text)) {
+      const extracted = extractThinking(text);
+      text = extracted.cleanText;
+      inlineReasoning = extracted.reasoning;
+    }
+
+    const reasoningText = [explicitReasoning.trim(), inlineReasoning.trim()]
+      .filter(Boolean)
+      .join('\n\n');
+
+    if (outputTokens === 0 && (rawText.length > 0 || explicitReasoning.length > 0)) {
+      outputTokens = Math.ceil((rawText.length + explicitReasoning.length) / 4);
+    }
+
+    const out: ChatResponse = {
+      text,
+      toolCalls,
+      usage: {
+        inputTokens,
+        outputTokens,
+      },
+      stopReason:
+        stopReason === 'tool_use' || toolCalls.length > 0
+          ? 'tool_use'
+          : stopReason === 'max_tokens'
+            ? 'max_tokens'
+            : stopReason === 'end_turn'
+              ? 'end'
+              : 'other',
+    };
+    if (reasoningText.length > 0) {
+      out.reasoning = reasoningText;
+    }
+    return out;
+  }
+}
+
+function appendBounded(current: string, addition: string): string {
+  if (current.length + addition.length > MAX_ACCUMULATED_TEXT_CHARS) {
+    throw new ProviderError(
+      `Streamed response exceeded maximum buffer limit (${MAX_ACCUMULATED_TEXT_CHARS} chars)`,
+      413,
+      false,
+    );
+  }
+  return current + addition;
 }
 
 function safeParse(json: string): unknown {

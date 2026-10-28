@@ -13,6 +13,8 @@
     "check": "pnpm --filter @excelai/shared build && pnpm -r check",
     "test": "pnpm --filter @excelai/shared build && pnpm -r test",
     "smoke": "pnpm build && pnpm --filter @excelai/sidecar smoke",
+    "dev": "pnpm --filter @excelai/sidecar dev",
+    "start": "pnpm --filter @excelai/sidecar start",
     "dev:sidecar": "pnpm --filter @excelai/sidecar dev",
     "start:offline": "node scripts/run-offline.mjs"
   }

@@ -6,8 +6,20 @@ import type {
 } from './types.js';
 
 export type ScriptedTurn =
-  | { text: string }
-  | { toolCalls: { name: string; args: unknown }[]; text?: string };
+  | {
+      text: string;
+      stopReason?: ChatResponse['stopReason'];
+      reasoning?: string;
+      reasoningChunks?: string[];
+      textChunks?: string[];
+    }
+  | {
+      toolCalls: { name: string; args: unknown }[];
+      text?: string;
+      reasoning?: string;
+      reasoningChunks?: string[];
+      textChunks?: string[];
+    };
 
 /**
  * Deterministic provider for tests and harness development: plays back a
@@ -37,6 +49,16 @@ export class ScriptedProvider implements Provider {
       };
     }
     this.turn++;
+    if (options.onDelta) {
+      for (const r of current.reasoningChunks ?? (current.reasoning ? [current.reasoning] : [])) {
+        options.onDelta({ reasoning: r });
+      }
+      for (const t of current.textChunks ?? (current.text ? [current.text] : [])) {
+        if (!/<(?:think|thinking|tool_call)>/i.test(t)) {
+          options.onDelta({ text: t });
+        }
+      }
+    }
     if ('toolCalls' in current) {
       const toolCalls: ToolCall[] = current.toolCalls.map((tc, i) => ({
         id: `call_${this.turn}_${i}`,
@@ -48,13 +70,18 @@ export class ScriptedProvider implements Provider {
         toolCalls,
         usage: { inputTokens: 1, outputTokens: 1 },
         stopReason: 'tool_use',
+        ...(current.reasoning !== undefined ? { reasoning: current.reasoning } : {}),
       };
     }
-    return {
+    const out: ChatResponse = {
       text: current.text,
       toolCalls: [],
       usage: { inputTokens: 1, outputTokens: 1 },
-      stopReason: 'end',
+      stopReason: current.stopReason ?? 'end',
     };
+    if (current.reasoning !== undefined) {
+      out.reasoning = current.reasoning;
+    }
+    return out;
   }
 }

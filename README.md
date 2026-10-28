@@ -16,7 +16,7 @@ Connect **any** local or self-hosted AI model (LM Studio, Ollama, embedded in-pr
 * 🌓 **Adaptive Office Dark Theme:** Dynamically adapts to Excel's Dark Gray, Black, and Colorful themes (`Office.context.officeTheme` and OS `prefers-color-scheme`) with a 3-way toggle (Auto / Dark / Light).
 * 🛑 **Instant Stop / Abort:** Full cancellation propagation (`AbortSignal`) across the agent loop, provider requests, custom functions (`CustomFunctions.Invocation.onCanceled`), and long-running MCP queries.
 * 🎯 **Dynamic Range Interaction:** Live selection tracking ("Include Selection" chip) and interactive "Jump to Range" navigation that scrolls and highlights proposed change targets directly on the active worksheet.
-* 🧪 **158 Automated Tests:** Exhaustive unit, component, integration, and E2E smoke tests ensuring zero regressions across all packages.
+* 🧪 **162 Automated Tests:** Exhaustive unit, component, integration, and E2E smoke tests ensuring zero regressions across all packages.
 
 ---
 
@@ -71,14 +71,14 @@ Clone the repository and run the setup commands:
 # 1. Install dependencies without running untrusted third-party scripts
 pnpm install --ignore-scripts
 
-# 2. Verify type safety and test suite (158 tests)
+# 2. Verify type safety and test suite (162 tests)
 pnpm check
 pnpm test
 
 # 3. Build production bundles
 pnpm build
 
-# 4. Start the sidecar companion daemon
+# 4. Start the sidecar companion daemon (or use `pnpm dev` / `pnpm start`)
 pnpm dev:sidecar
 ```
 
@@ -125,6 +125,37 @@ No executable installer (`.exe`) is needed. Modern Office add-ins run securely i
    * **Ollama:** Click **Use Ollama defaults** (`http://127.0.0.1:11434/v1`) $\rightarrow$ click **Scan / List models** to pick from your installed local models.
    * **Embedded GGUF:** Select *Embedded GGUF* to run local quantized weights completely in-process using `node-llama-cpp`.
    * **MCP Connectors:** Switch to the **MCP Connectors** tab to whitelist approved folders and attach local SQLite databases or CSV collections.
+
+---
+
+### 4. Hardware Tiers & Recommended Local Model Settings
+
+Because the agent sends workbook tool schemas, multi-turn conversation history, and spreadsheet range data with each turn—and **reasoning/thinking models** also spend output tokens on internal `<think>` / `reasoning_content` blocks before emitting a tool call—default **4K or 8K (`8192`) context windows** in LM Studio or Ollama can easily run out of tokens (`finish_reason: "length"` / *"The model ran out of output tokens before producing a reply"*).
+
+Use the table below to tune **LM Studio**, **Ollama**, or **Embedded GGUF** for your machine's memory:
+
+| System RAM / Unified Memory | Recommended Model Size & Quant | Context Length (`n_ctx`) | KV Cache & Attention Settings | Best For |
+| :--- | :--- | :--- | :--- | :--- |
+| **16 GB RAM** *(Entry / Laptop)* | **7B – 8B** (`Q4_K_M`)<br>*(e.g. Qwen 2.5 7B, Llama 3.1 8B)* | **`16384` (16K)**<br>*(8K minimum; avoid reasoning models on 8K)* | • **Flash Attention:** ON<br>• **KV Cache:** `Q8_0` (or `Q4_0` if VRAM-tight) | Single-sheet edits, formula generation, and targeted range queries (`A1:G30`). |
+| **32 GB – 64 GB RAM** *(Workstation / Gaming PC)* | **14B – 32B** (`Q4_K_M` – `Q6_K`)<br>*(e.g. Qwen 2.5 14B/32B, DeepSeek-R1 Distill)* | **`32768` (32K)** | • **Flash Attention:** ON<br>• **KV Cache:** `Q8_0` or `FP16` | Multi-sheet analysis, reasoning models, and MCP database/CSV queries. |
+| **128 GB – 192 GB+ RAM** *(High-Memory Workstation)* | **32B – 70B+ / MoE** (`Q6_K`, `Q8_0`, or `FP16`) | **`65536` (64K) – `131072` (128K)** | • **Flash Attention:** ON<br>• **KV Cache:** Unquantized `FP16` (or `Q8_0`) | Long multi-turn sessions, deep reasoning models, and large tabular imports with maximum numerical precision. |
+
+#### Practical Tuning Tips
+
+* **Why 64K–128K on High-Memory Machines (128 GB – 192 GB+ RAM):**
+  * Setting the context slider in LM Studio to **`65536` (64K)** or **`131072` (128K)** only pre-allocates KV cache RAM (which you have plenty of)—prompt processing speed only scales with how many tokens are *actually* in the current conversation.
+  * Keep **KV Cache Quantization** at **unquantized `FP16`** (or `Q8_0`) rather than `Q4_0`: aggressive KV cache quantization can degrade precision on exact cell coordinates (`Sheet1!D14:G42`) and numerical values.
+  * Always enable **Flash Attention** in LM Studio's Model Loader settings to accelerate prompt evaluation and reduce KV cache overhead.
+* **Using Reasoning / "Thinking" Models:**
+  * Reasoning models generate internal chain-of-thought tokens (`reasoning_content`) before emitting tool calls or replies. Ensure your context window is at least **16K–32K+** so a 6K–7K prompt doesn't leave the model with only ~1,000 tokens before hitting an 8K ceiling.
+  * Prefer **specific requests** (e.g., *"Build a 5-row monthly budget table in Sheet1!A1:D6 with SUM formulas"*) over open-ended prompts (*"Can you build something and show me?"*), which can cause reasoning models to spend 1,000+ tokens deliberating what sample topic to invent.
+* **Ollama Context Override (`num_ctx`):**
+  * Ollama defaults to a `2048` or `4096` token context window unless overridden. To run with a 32K or 64K window in Ollama, create a `Modelfile` with `PARAMETER num_ctx 32768` (or `65536`) or set `OLLAMA_CONTEXT_LENGTH=32768` in your environment before starting `ollama serve`.
+* **Sidecar Power-User Knobs & Loop Safeguards ([`sidecar/src/agent/loop.ts`](sidecar/src/agent/loop.ts)):**
+  * `maxTokens: 16384` caps the maximum completion tokens (reasoning + tool calls) per turn. On 64K–128K context setups with heavy reasoning models, you can raise this to `32768`.
+  * `maxIterations = 24` sets the maximum tool-calling steps per turn. On the final step (or immediately if a local model repeats an identical tool call), the sidecar automatically disables `tools` for one synthesis step so the model summarizes its progress or asks a clarifying question in plain text instead of timing out.
+  * **Reasoning Exhaustion Recovery:** If a local reasoning model (`reasoning_content`) exhausts its token budget mid-thought without emitting a tool call or reply, the agent loop automatically detects it (even when the server reports `finish_reason: "stop"`) and sends one continuation nudge to emit the tool call or answer directly.
+  * `MAX_TOOL_RESULT_CHARS = 20_000` caps the size of a single `read_range` call (~5,000 tokens) to protect smaller context windows. On 64K–128K setups, you can increase this if you want the agent to inspect larger cell ranges in a single step.
 
 ---
 
@@ -197,7 +228,7 @@ Run the full verification pipeline:
 # Type check all packages
 pnpm check
 
-# Run all 158 unit and integration tests
+# Run all 162 unit and integration tests
 pnpm test
 
 # Build production distribution

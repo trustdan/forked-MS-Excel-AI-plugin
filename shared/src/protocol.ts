@@ -68,6 +68,9 @@ export type ApplyOpsRequest = Envelope<
 
 export type AgentEvent = Envelope<
   'agent_event',
+  | { kind: 'thinking_delta'; text: string }
+  | { kind: 'text_delta'; text: string }
+  | { kind: 'thinking'; text: string; durationMs?: number }
   | { kind: 'text'; text: string }
   | { kind: 'tool_use'; tool: string; summary: string }
   | { kind: 'changeset_staged'; changeSetId: string; preview: ChangePreviewItem[] }

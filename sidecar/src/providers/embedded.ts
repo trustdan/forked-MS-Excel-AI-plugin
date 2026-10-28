@@ -11,6 +11,7 @@ import {
   type ToolCall,
   type ToolSpec,
 } from './types.js';
+import { ThinkStreamSplitter } from './sse.js';
 
 export function getModelsDir(): string {
   const custom = process.env.EXCELAI_MODELS_DIR;
@@ -99,6 +100,7 @@ export interface LlamaEngineBackend {
       temperature?: number;
       maxTokens?: number;
       abortSignal?: AbortSignal;
+      onToken?: (chunk: string) => void;
     },
   ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }>;
   dispose?(): Promise<void>;
@@ -123,6 +125,7 @@ export class NodeLlamaCppBackend implements LlamaEngineBackend {
       temperature?: number;
       maxTokens?: number;
       abortSignal?: AbortSignal;
+      onToken?: (chunk: string) => void;
     },
   ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }> {
     if (options.abortSignal?.aborted) {
@@ -173,6 +176,11 @@ export class NodeLlamaCppBackend implements LlamaEngineBackend {
         temperature: options.temperature ?? 0.2,
         maxTokens: options.maxTokens ?? 2048,
         signal: options.abortSignal,
+        onTextChunk: options.onToken
+          ? (chunk: string) => {
+              options.onToken?.(chunk);
+            }
+          : undefined,
       });
 
       return {
@@ -200,7 +208,11 @@ export class NodeLlamaCppBackend implements LlamaEngineBackend {
  */
 export class MockLlamaBackend implements LlamaEngineBackend {
   constructor(
-    private handler?: (prompt: string, signal?: AbortSignal) => Promise<string> | string,
+    private handler?: (
+      prompt: string,
+      signal?: AbortSignal,
+      onToken?: (chunk: string) => void,
+    ) => Promise<string> | string,
   ) {}
 
   async generate(
@@ -210,6 +222,7 @@ export class MockLlamaBackend implements LlamaEngineBackend {
       temperature?: number;
       maxTokens?: number;
       abortSignal?: AbortSignal;
+      onToken?: (chunk: string) => void;
     },
   ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }> {
     if (options.abortSignal?.aborted) {
@@ -217,7 +230,15 @@ export class MockLlamaBackend implements LlamaEngineBackend {
     }
 
     if (this.handler) {
-      const result = await this.handler(prompt, options.abortSignal);
+      let emittedToken = false;
+      const wrappedOnToken = (chunk: string): void => {
+        emittedToken = true;
+        options.onToken?.(chunk);
+      };
+      const result = await this.handler(prompt, options.abortSignal, wrappedOnToken);
+      if (!emittedToken && options.onToken && result) {
+        options.onToken(result);
+      }
       return {
         text: result,
         inputTokens: Math.ceil(prompt.length / 4),
@@ -225,8 +246,10 @@ export class MockLlamaBackend implements LlamaEngineBackend {
       };
     }
 
+    const fallback = 'Embedded local model response: OK';
+    options.onToken?.(fallback);
     return {
-      text: 'Embedded local model response: OK',
+      text: fallback,
       inputTokens: Math.ceil(prompt.length / 4),
       outputTokens: 8,
     };
@@ -288,6 +311,141 @@ export function formatLlamaPrompt(messages: ChatMessage[], tools?: ToolSpec[]): 
   return prompt;
 }
 
+function parseXmlScalarOrJson(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']')) ||
+    trimmed === 'true' ||
+    trimmed === 'false' ||
+    trimmed === 'null' ||
+    /^-?\d+(\.\d+)?$/.test(trimmed)
+  ) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+  return trimmed;
+}
+
+function parseSingleToolCallBody(inner: string): { name: string; argsJson: string } | null {
+  const trimmed = inner.trim();
+  if (!trimmed) return null;
+
+  // 1. Standard JSON object: {"name": "...", "arguments": {...}} or {"tool": "...", "args": {...}}
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        name?: string;
+        tool?: string;
+        arguments?: unknown;
+        args?: unknown;
+        parameters?: unknown;
+      };
+      const name = parsed.name || parsed.tool;
+      const args = parsed.arguments ?? parsed.args ?? parsed.parameters ?? {};
+      if (name && typeof name === 'string') {
+        return {
+          name: name.trim(),
+          argsJson: typeof args === 'string' ? args : JSON.stringify(args),
+        };
+      }
+    } catch {
+      // Fall through to XML/tag parsers
+    }
+  }
+
+  // 2. <function=tool_name><parameter=key>val</parameter>...</function>
+  const fnTagMatch = /<function=([a-zA-Z0-9_:-]+)>([\s\S]*?)(?:<\/function>|$)/i.exec(trimmed);
+  if (fnTagMatch && fnTagMatch[1]) {
+    const name = fnTagMatch[1].trim();
+    const body = fnTagMatch[2] ?? '';
+    const args: Record<string, unknown> = {};
+    const paramRegex = /<parameter=([a-zA-Z0-9_:-]+)>([\s\S]*?)<\/parameter>/gi;
+    let pMatch: RegExpExecArray | null;
+    while ((pMatch = paramRegex.exec(body)) !== null) {
+      if (pMatch[1]) {
+        args[pMatch[1].trim()] = parseXmlScalarOrJson(pMatch[2] ?? '');
+      }
+    }
+    return { name, argsJson: JSON.stringify(args) };
+  }
+
+  // 3. GLM-4 / Qwen / Flint XML format:
+  //    e.g. "read_range<arg_key>range</arg_key><arg_value>Sheet1!A1:B5</arg_value>"
+  //    or   "get_active_sheet</arg_value>"
+  //    or   "get_workbook_map"
+  //    or   "read_range {\"range\":\"Sheet1!A1:B5\"}"
+  const leadingNameMatch = /^([a-zA-Z][a-zA-Z0-9_:-]*)\b([\s\S]*)$/.exec(trimmed);
+  if (leadingNameMatch && leadingNameMatch[1]) {
+    const name = leadingNameMatch[1].trim();
+    const rest = (leadingNameMatch[2] ?? '').trim();
+
+    if (rest.includes('<arg_key>')) {
+      const args: Record<string, unknown> = {};
+      const argPairRegex = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)(?:<\/arg_value>|$)/gi;
+      let aMatch: RegExpExecArray | null;
+      while ((aMatch = argPairRegex.exec(rest)) !== null) {
+        const key = aMatch[1]?.trim();
+        if (key) {
+          args[key] = parseXmlScalarOrJson(aMatch[2] ?? '');
+        }
+      }
+      return { name, argsJson: JSON.stringify(args) };
+    }
+
+    if (rest.startsWith('{')) {
+      try {
+        const parsedArgs = JSON.parse(rest);
+        return { name, argsJson: JSON.stringify(parsedArgs) };
+      } catch {
+        // ignore
+      }
+    }
+
+    // Bare tool name or trailing closing fragments like "</arg_value>"
+    if (rest === '' || /^(?:<\/[a-zA-Z0-9_:-]+>\s*)+$/i.test(rest)) {
+      return { name, argsJson: '{}' };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract <think>...</think> or <thinking>...</thinking> blocks (including unclosed
+ * trailing blocks when generation hits max_tokens mid-thought) from raw model text.
+ */
+export function extractThinking(rawText: string): { cleanText: string; reasoning: string } {
+  const parts: string[] = [];
+  const closedRegex = /<(?:think|thinking)>([\s\S]*?)<\/(?:think|thinking)>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = closedRegex.exec(rawText)) !== null) {
+    const inner = match[1]?.trim();
+    if (inner) parts.push(inner);
+  }
+
+  let cleanText = rawText.replace(closedRegex, '');
+
+  // Handle unclosed trailing <think> or <thinking> block (e.g. truncated by max_tokens
+  // or when a small local model omits </think> before emitting <tool_call>)
+  const unclosedRegex = /<(?:think|thinking)>([\s\S]*?)(?=<tool_call>|$)/i;
+  const unclosedMatch = unclosedRegex.exec(cleanText);
+  if (unclosedMatch) {
+    const inner = unclosedMatch[1]?.trim();
+    if (inner) parts.push(inner);
+    cleanText = cleanText.replace(unclosedRegex, '');
+  }
+
+  return {
+    cleanText: cleanText.trim(),
+    reasoning: parts.join('\n\n'),
+  };
+}
+
 /**
  * Extract structured tool calls from model output.
  */
@@ -295,25 +453,19 @@ export function extractToolCalls(rawText: string): { cleanText: string; toolCall
   const toolCalls: ToolCall[] = [];
   let cleanText = rawText;
 
-  // 1. Check for <tool_call>...</tool_call> tags
-  const tagRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+  // 1. Check for <tool_call>...</tool_call> tags (including unclosed trailing <tool_call>)
+  const tagRegex = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/gi;
   let match: RegExpExecArray | null;
   while ((match = tagRegex.exec(rawText)) !== null) {
     const inner = match[1]?.trim();
     if (!inner) continue;
-    try {
-      const parsed = JSON.parse(inner) as { name?: string; tool?: string; arguments?: unknown; args?: unknown };
-      const name = parsed.name || parsed.tool;
-      const args = parsed.arguments ?? parsed.args ?? {};
-      if (name && typeof name === 'string') {
-        toolCalls.push({
-          id: `call_${crypto.randomUUID().slice(0, 8)}`,
-          name,
-          argsJson: typeof args === 'string' ? args : JSON.stringify(args),
-        });
-      }
-    } catch {
-      // Ignored malformed tool block
+    const parsed = parseSingleToolCallBody(inner);
+    if (parsed) {
+      toolCalls.push({
+        id: `call_${crypto.randomUUID().slice(0, 8)}`,
+        name: parsed.name,
+        argsJson: parsed.argsJson,
+      });
     }
   }
 
@@ -346,6 +498,19 @@ export function extractToolCalls(rawText: string): { cleanText: string; toolCall
       } catch {
         // Not a JSON tool block
       }
+    }
+  }
+
+  // 3. Fallback: bare <function=tool_name>... or tool_name<arg_key>... emitted without outer <tool_call> wrapper
+  if (toolCalls.length === 0 && (/<function=/i.test(rawText) || /<arg_key>/i.test(rawText))) {
+    const parsed = parseSingleToolCallBody(rawText);
+    if (parsed) {
+      toolCalls.push({
+        id: `call_${crypto.randomUUID().slice(0, 8)}`,
+        name: parsed.name,
+        argsJson: parsed.argsJson,
+      });
+      cleanText = '';
     }
   }
 
@@ -396,6 +561,7 @@ export class EmbeddedLlamaProvider implements Provider {
     }
 
     const prompt = formatLlamaPrompt(options.messages, options.tools);
+    const splitter = options.onDelta ? new ThinkStreamSplitter(options.onDelta) : undefined;
 
     const result = await this.backend.generate(prompt, {
       modelPath: this.resolvedPath,
@@ -405,18 +571,30 @@ export class EmbeddedLlamaProvider implements Provider {
       temperature: options.temperature,
       maxTokens: options.maxTokens,
       abortSignal: options.abortSignal,
+      onToken: splitter ? (chunk) => splitter.pushContent(chunk) : undefined,
     });
+    splitter?.flush();
 
-    const { cleanText, toolCalls } = extractToolCalls(result.text);
+    const { cleanText: withoutThinking, reasoning } = extractThinking(result.text);
+    const { cleanText, toolCalls } = extractToolCalls(withoutThinking);
 
-    return {
+    const out: ChatResponse = {
       text: cleanText,
       toolCalls,
       usage: {
         inputTokens: result.inputTokens ?? Math.ceil(prompt.length / 4),
         outputTokens: result.outputTokens ?? Math.ceil(result.text.length / 4),
       },
-      stopReason: toolCalls.length > 0 ? 'tool_use' : 'end',
+      stopReason:
+        toolCalls.length > 0
+          ? 'tool_use'
+          : !cleanText.trim() && reasoning.length > 0
+            ? 'max_tokens'
+            : 'end',
     };
+    if (reasoning.length > 0) {
+      out.reasoning = reasoning;
+    }
+    return out;
   }
 }

@@ -329,8 +329,13 @@ function getRange(
   if (bang < 0) {
     return context.workbook.worksheets.getActiveWorksheet().getRange(ref);
   }
-  const sheetName = ref.slice(0, bang).replace(/^'|'$/g, '');
+  const sheetName = ref.slice(0, bang).replace(/^'|'$/g, '').trim();
   const address = ref.slice(bang + 1);
+  // Local models sometimes pass the workbook filename (e.g. "Book 2026-10-28.xlsx!A1:B5")
+  // instead of a worksheet tab name; route workbook filenames to the active worksheet.
+  if (/\.(xlsx|xlsm|xlsb|xls|csv)$/i.test(sheetName)) {
+    return context.workbook.worksheets.getActiveWorksheet().getRange(address);
+  }
   const sheet = addedSheets?.get(sheetName) ?? context.workbook.worksheets.getItem(sheetName);
   return sheet.getRange(address);
 }

@@ -4,8 +4,9 @@ import { OpenAIProvider } from './openai.js';
 import { ProviderError, type Provider, type ProviderConfig } from './types.js';
 
 export * from './types.js';
+export * from './sse.js';
 export { AnthropicProvider } from './anthropic.js';
-export { EmbeddedLlamaProvider, listLocalGgufModels, resolveModelPath, getModelsDir, MockLlamaBackend } from './embedded.js';
+export { EmbeddedLlamaProvider, listLocalGgufModels, resolveModelPath, getModelsDir, MockLlamaBackend, extractThinking, extractToolCalls } from './embedded.js';
 export { OpenAIProvider } from './openai.js';
 export { ScriptedProvider, type ScriptedTurn } from './scripted.js';
 

@@ -286,5 +286,319 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(events.some((e) => e.kind === 'stopped')).toBe(true);
     expect(result.stagedChangeSetId).toBeUndefined();
   });
-});
 
+  it('validates write_range cell dimensions against target range immediately and deduplicates same-range writes', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A2:E2',
+              cells: [[null, '2026-10-01', 'Office Supplies', 'Supplies', 'Expense', 120.5]],
+              reason: '6 cols in 5-col range',
+            },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A2:E2',
+              cells: [['2026-10-01', 'Office Supplies', 'Supplies', 'Expense', 120.5]],
+              reason: 'initial valid write',
+            },
+          },
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A2:E2',
+              cells: [['2026-10-01', 'Office Supplies', 'Supplies', 'Expense', 150]],
+              reason: 'updated valid write on same range',
+            },
+          },
+        ],
+      },
+      { text: 'Staged clean row.' },
+    ]);
+
+    const { stagedId, changeSets } = await runScript(wb, provider);
+    const repairMsg = provider.requests.at(1)?.messages.findLast((m) => m.role === 'tool');
+    expect(repairMsg && 'content' in repairMsg ? repairMsg.content : '').toContain(
+      'Row 1 has 6 column(s), expected 5',
+    );
+
+    expect(stagedId).toBeDefined();
+    const cs = changeSets.get(stagedId!)!;
+    expect(cs.ops).toHaveLength(1);
+    expect(cs.ops[0]?.kind === 'write_range' ? cs.ops[0].cells[0]?.[4] : undefined).toEqual({
+      value: 150,
+    });
+  });
+
+  it('recovers with a nudge, preserves partial reasoning draft, and expands maxTokens when a reasoning model exhausts max_tokens', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const provider = new ScriptedProvider([
+      {
+        text: '',
+        stopReason: 'max_tokens',
+        reasoning: 'Drafting 2024 balance sheet: Cash 401900, Raw Materials 419500',
+      },
+      {
+        text: '',
+        stopReason: 'max_tokens',
+        reasoning: 'Row 1: Pax Vans, Row 2: Cash 401900, Row 3: Raw Materials 419500',
+      },
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: { range: 'Sheet1!A1:B1', cells: [['Net Total', 100]], reason: 'summary' },
+          },
+        ],
+      },
+      { text: 'Completed summary.' },
+    ]);
+
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const events: AgentEvent[] = [];
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Test.xlsx',
+      history: [],
+      userMessage: 'do the thing',
+      onEvent: (ev) => events.push(ev),
+    });
+
+    expect(result.stagedChangeSetId).toBeDefined();
+    expect(events.some((e) => e.kind === 'text' && e.text.includes('Completed summary.'))).toBe(true);
+    expect(events.some((e) => e.kind === 'error')).toBe(false);
+
+    // Normal step uses 8192 + reasoningEffort: 'low'; recovery step expands to 16384 and includes reasoning tail
+    expect(provider.requests.at(0)?.maxTokens).toBe(8192);
+    expect(provider.requests.at(0)?.reasoningEffort).toBe('low');
+    expect(provider.requests.at(1)?.maxTokens).toBe(16384);
+    const firstRecoveryMsg = provider.requests.at(1)?.messages.at(-1);
+    expect(firstRecoveryMsg?.role === 'user' ? firstRecoveryMsg.content : '').toContain('Cash 401900');
+
+    // Recovery nudge messages must not remain in persisted conversation history
+    expect(
+      result.history.some((m) => m.role === 'user' && m.content.includes('[System note:')),
+    ).toBe(false);
+  });
+
+  it('normalizes workbook filename used as sheet name and breaks duplicate tool-call loops by disabling tools', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 'Header');
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const events: AgentEvent[] = [];
+
+    const provider = new ScriptedProvider([
+      { toolCalls: [{ name: 'read_range', args: { range: 'Book 2026-10-28.xlsx!A1:B5' } }] },
+      { toolCalls: [{ name: 'read_range', args: { range: 'Book 2026-10-28.xlsx!A1:B5' } }] },
+      { text: 'I read Sheet1!A1:B5. Which cells would you like me to update?' },
+    ]);
+
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book 2026-10-28.xlsx',
+      history: [],
+      userMessage: 'help with this sheet',
+      onEvent: (ev) => events.push(ev),
+    });
+
+    // First call resolved Book 2026-10-28.xlsx!A1:B5 -> Sheet1!A1:B5 and read 'Header'
+    const firstToolMsg = provider.requests.at(1)?.messages.findLast((m) => m.role === 'tool');
+    expect(firstToolMsg && 'content' in firstToolMsg ? firstToolMsg.content : '').toContain('Header');
+
+    // Second identical call triggered duplicate guard and disabled tools on step 3
+    const secondToolMsg = provider.requests.at(2)?.messages.findLast((m) => m.role === 'tool');
+    expect(secondToolMsg && 'content' in secondToolMsg ? secondToolMsg.content : '').toContain(
+      'duplicateCall',
+    );
+    expect(provider.requests.at(2)?.tools).toBeUndefined();
+
+    // Duplicate assistant/tool pair was stripped from persisted history
+    expect(result.history.filter((m) => m.role === 'tool')).toHaveLength(1);
+  });
+
+  it('rescues raw XML <tool_call> tags emitted in content (e.g. GLM/Flint <tool_call>get_active_sheet</arg_value></tool_call>) and aliases get_active_sheet to get_workbook_map', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const events: AgentEvent[] = [];
+
+    const provider = new ScriptedProvider([
+      {
+        text: '<tool_call>get_active_sheet</arg_value></tool_call>',
+        toolCalls: [],
+        stopReason: 'end',
+      },
+      {
+        text: '<tool_call>write_range<arg_key>range</arg_key><arg_value>Sheet1!A1:B1</arg_value><arg_key>cells</arg_key><arg_value>[["Van Model", "Capacity"]]</arg_value><arg_key>reason</arg_key><arg_value>Add Pax Vans header</arg_value></tool_call>',
+        toolCalls: [],
+        stopReason: 'end',
+      },
+      { text: 'Created the Pax Vans table header in Sheet1!A1:B1.' },
+    ]);
+
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book 2026-10-28.xlsx',
+      history: [],
+      userMessage: 'Build the Pax Vans table',
+      onEvent: (ev) => events.push(ev),
+    });
+
+    // Raw <tool_call> tags must never leak into user-visible text events
+    expect(events.some((e) => e.kind === 'text' && e.text.includes('<tool_call>'))).toBe(false);
+    // get_active_sheet was aliased and executed as get_workbook_map
+    expect(events.some((e) => e.kind === 'tool_use' && e.tool === 'get_workbook_map')).toBe(true);
+    // XML write_range was rescued and staged
+    expect(result.stagedChangeSetId).toBeDefined();
+    await changeSets.apply(result.stagedChangeSetId!);
+    expect(wb.getValue('Sheet1!A1')).toBe('Van Model');
+    expect(wb.getValue('Sheet1!B1')).toBe('Capacity');
+  });
+
+  it('auto-expands write_range dimensions from a start cell or approximate row count and pads shorter header rows', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1:B3', // 4 rows passed for a 3-row range, plus 1-col header row
+              cells: [
+                ['Pax Vans Balance Sheet'],
+                ['Cash', 401900],
+                ['Raw Materials', 419500],
+                ['Total Current Assets', { formula: '=SUM(B2:B3)' }],
+              ],
+              reason: 'Record 2024 starting balances',
+            },
+          },
+        ],
+      },
+      { text: 'Staged 2024 starting balances.' },
+    ]);
+
+    const { stagedId, changeSets } = await runScript(wb, provider);
+    expect(stagedId).toBeDefined();
+    const cs = changeSets.get(stagedId!)!;
+    expect(cs.ops[0]).toMatchObject({
+      kind: 'write_range',
+      range: 'Sheet1!A1:B4',
+    });
+
+    const applied = await changeSets.apply(stagedId!);
+    expect(applied.ok).toBe(true);
+    expect(wb.getValue('Sheet1!A1')).toBe('Pax Vans Balance Sheet');
+    expect(wb.getValue('Sheet1!B4')).toBe(821400);
+  });
+
+  it('emits thinking events with durationMs from reasoning fields and inline <think> tags without leaking <think> into text', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 100);
+
+    const provider = new ScriptedProvider([
+      {
+        reasoning: 'First, let me inspect the workbook structure.',
+        toolCalls: [{ name: 'get_workbook_map', args: {} }],
+      },
+      {
+        text: '<think>Now I know Sheet1!A1 has 100. I will report it.</think>Cell A1 contains 100.',
+      },
+    ]);
+
+    const { events } = await runScript(wb, provider);
+
+    const thinkingEvents = events.filter((e) => e.kind === 'thinking');
+    expect(thinkingEvents).toHaveLength(2);
+    expect(thinkingEvents[0]).toMatchObject({
+      kind: 'thinking',
+      text: 'First, let me inspect the workbook structure.',
+    });
+    if (thinkingEvents[0]?.kind === 'thinking') {
+      expect(thinkingEvents[0].durationMs).toBeGreaterThan(0);
+    }
+    expect(thinkingEvents[1]).toMatchObject({
+      kind: 'thinking',
+      text: 'Now I know Sheet1!A1 has 100. I will report it.',
+    });
+
+    const textEvents = events.filter((e) => e.kind === 'text');
+    expect(textEvents).toEqual([{ kind: 'text', text: 'Cell A1 contains 100.' }]);
+  });
+
+  it('streams thinking_delta and text_delta events live before finalized thinking and text events', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const provider = new ScriptedProvider([
+      {
+        reasoningChunks: ['Step 1: ', 'check Sheet1.'],
+        reasoning: 'Step 1: check Sheet1.',
+        textChunks: ['All ', 'done!'],
+        text: 'All done!',
+      },
+    ]);
+
+    const { events } = await runScript(wb, provider);
+
+    expect(events.filter((e) => e.kind === 'thinking_delta')).toEqual([
+      { kind: 'thinking_delta', text: 'Step 1: ' },
+      { kind: 'thinking_delta', text: 'check Sheet1.' },
+    ]);
+    expect(events.filter((e) => e.kind === 'text_delta')).toEqual([
+      { kind: 'text_delta', text: 'All ' },
+      { kind: 'text_delta', text: 'done!' },
+    ]);
+    expect(events.some((e) => e.kind === 'thinking' && e.text === 'Step 1: check Sheet1.')).toBe(
+      true,
+    );
+    expect(events.some((e) => e.kind === 'text' && e.text === 'All done!')).toBe(true);
+  });
+
+  it('pre-populates the current workbook sheet structure into the system prompt so the model can skip redundant get_workbook_map calls', async () => {
+    const wb = new WorkbookEmulator(['Sheet1', 'Summary']);
+    wb.setCell('Sheet1!A1', 'Revenue');
+    wb.setCell('Sheet1!B2', 500);
+
+    const provider = new ScriptedProvider([{ text: 'Ready.' }]);
+    await runScript(wb, provider);
+
+    const sysMsg = provider.requests[0]?.messages.find((m) => m.role === 'system');
+    expect(sysMsg?.content).toContain('Current workbook structure (already loaded');
+    expect(sysMsg?.content).toContain('Sheet "Sheet1": usedRange Sheet1!A1:B2 (2×2)');
+    expect(sysMsg?.content).toContain('Sheet "Summary": empty');
+  });
+
+  it('rescues a complete write_range JSON block drafted inside reasoning_content when reasoning hits max_tokens and unwraps 3-D cells nesting', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const provider = new ScriptedProvider([
+      {
+        text: '',
+        stopReason: 'max_tokens',
+        reasoning: `Let me write the balance sheet:\n\`\`\`json\n{\n  "range": "Sheet1!A1",\n  "cells": [\n    [["ASSETS:"]],\n    [["Cash", 401900]],\n    [["Raw Materials", 419500]]\n  ],\n  "reason": "Record starting balances"\n}\n\`\`\`\nWait, let me double check...`,
+      },
+      { text: 'Staged the 2024 balance sheet.' },
+    ]);
+
+    const { stagedId, changeSets } = await runScript(wb, provider);
+    expect(stagedId).toBeDefined();
+    await changeSets.apply(stagedId!);
+    expect(wb.getValue('Sheet1!A1')).toBe('ASSETS:');
+    expect(wb.getValue('Sheet1!A2')).toBe('Cash');
+    expect(wb.getValue('Sheet1!B2')).toBe(401900);
+    expect(wb.getValue('Sheet1!A3')).toBe('Raw Materials');
+    expect(wb.getValue('Sheet1!B3')).toBe(419500);
+  });
+});

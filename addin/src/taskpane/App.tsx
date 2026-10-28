@@ -21,12 +21,161 @@ import {
   resolveIsDark,
   setStoredThemePreference,
 } from './theme.js';
-import type { ChatItem, ProviderList } from './types.js';
+import type { ActivityStep, ChatItem, ProviderList } from './types.js';
 import { PairingScreen } from './components/pairing/PairingScreen.js';
 import { ModelsScreen } from './components/settings/ModelsScreen.js';
 import { McpScreen } from './components/settings/McpScreen.js';
 import { ChatBubble } from './components/chat/ChatBubble.js';
 import { Composer, type AttachedFile } from './components/chat/Composer.js';
+
+function closeActiveActivities(items: ChatItem[]): ChatItem[] {
+  let changed = false;
+  const next = items.map((it) => {
+    if (it.kind === 'activity' && it.active) {
+      changed = true;
+      return { ...it, active: false };
+    }
+    if (it.kind === 'assistant' && it.streaming) {
+      changed = true;
+      return { kind: 'assistant' as const, text: it.text };
+    }
+    return it;
+  });
+  return changed ? next : items;
+}
+
+function appendThinkingDelta(items: ChatItem[], delta: string): ChatItem[] {
+  if (!delta) return items;
+  const last = items[items.length - 1];
+  if (last && last.kind === 'activity' && last.active) {
+    const lastStep = last.steps[last.steps.length - 1];
+    if (lastStep && lastStep.kind === 'thinking' && lastStep.durationMs === undefined) {
+      return [
+        ...items.slice(0, -1),
+        {
+          ...last,
+          steps: [
+            ...last.steps.slice(0, -1),
+            { ...lastStep, text: lastStep.text + delta },
+          ],
+        },
+      ];
+    }
+    return [
+      ...items.slice(0, -1),
+      {
+        ...last,
+        steps: [...last.steps, { kind: 'thinking', text: delta }],
+      },
+    ];
+  }
+  return [
+    ...items,
+    {
+      kind: 'activity',
+      steps: [{ kind: 'thinking', text: delta }],
+      totalDurationMs: 0,
+      active: true,
+    },
+  ];
+}
+
+function appendTextDelta(items: ChatItem[], delta: string): ChatItem[] {
+  if (!delta) return items;
+  const last = items[items.length - 1];
+  if (last && last.kind === 'assistant' && last.streaming) {
+    return [
+      ...items.slice(0, -1),
+      { kind: 'assistant', text: last.text + delta, streaming: true },
+    ];
+  }
+  return [...closeActiveActivities(items), { kind: 'assistant', text: delta, streaming: true }];
+}
+
+function appendActivityStep(items: ChatItem[], step: ActivityStep): ChatItem[] {
+  const addDuration = step.kind === 'thinking' ? (step.durationMs ?? 0) : 0;
+  const last = items[items.length - 1];
+  if (last && last.kind === 'activity' && last.active) {
+    const lastStep = last.steps[last.steps.length - 1];
+    // Finalize an in-flight streamed thinking step when the completed thinking event arrives
+    if (step.kind === 'thinking' && lastStep && lastStep.kind === 'thinking' && lastStep.durationMs === undefined) {
+      return [
+        ...items.slice(0, -1),
+        {
+          ...last,
+          steps: [...last.steps.slice(0, -1), step],
+          totalDurationMs: last.totalDurationMs + addDuration,
+        },
+      ];
+    }
+    return [
+      ...items.slice(0, -1),
+      {
+        ...last,
+        steps: [...last.steps, step],
+        totalDurationMs: last.totalDurationMs + addDuration,
+      },
+    ];
+  }
+  return [
+    ...items,
+    {
+      kind: 'activity',
+      steps: [step],
+      totalDurationMs: addDuration,
+      active: true,
+    },
+  ];
+}
+
+export function applyAgentEventToItems(prev: ChatItem[], ev: AgentEventPayload): ChatItem[] {
+  switch (ev.kind) {
+    case 'thinking_delta':
+      return appendThinkingDelta(prev, ev.text);
+    case 'text_delta':
+      return appendTextDelta(prev, ev.text);
+    case 'thinking':
+      return appendActivityStep(prev, {
+        kind: 'thinking',
+        text: ev.text,
+        durationMs: ev.durationMs,
+      });
+    case 'tool_use':
+      return appendActivityStep(prev, {
+        kind: 'tool',
+        text: `${ev.tool} ${ev.summary}`.trim(),
+      });
+    case 'text': {
+      const last = prev[prev.length - 1];
+      if (last && last.kind === 'assistant' && last.streaming) {
+        return [...closeActiveActivities(prev.slice(0, -1)), { kind: 'assistant', text: ev.text }];
+      }
+      return [...closeActiveActivities(prev), { kind: 'assistant', text: ev.text }];
+    }
+    case 'changeset_staged':
+      return [
+        ...closeActiveActivities(prev),
+        { kind: 'changeset', id: ev.changeSetId, preview: ev.preview, status: 'staged' },
+      ];
+    case 'changeset_applied':
+      return prev.map((it) =>
+        it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: 'applied' } : it,
+      );
+    case 'changeset_undone':
+      return prev.map((it) =>
+        it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: 'undone' } : it,
+      );
+    case 'error':
+      return [...closeActiveActivities(prev), { kind: 'error', text: ev.message }];
+    case 'stopped':
+      return [
+        ...closeActiveActivities(prev),
+        { kind: 'stopped', text: ev.reason ?? 'Generation stopped by user.' },
+      ];
+    case 'done':
+      return closeActiveActivities(prev);
+  }
+}
 
 export function App(): JSX.Element {
   const [paired, setPaired] = useState<boolean>(() => getToken() !== null);
@@ -71,15 +220,22 @@ export function App(): JSX.Element {
     });
   }, []);
 
-  // Monitor Excel active selection changes
+  // Monitor Excel active selection changes and refresh on window focus
   useEffect(() => {
-    void getSelectedRangeInfo().then((info) => {
-      if (info) setSelection(info);
-    });
+    const refreshSelection = (): void => {
+      void getSelectedRangeInfo().then((info) => {
+        if (info) setSelection(info);
+      });
+    };
+    refreshSelection();
     const unregister = registerSelectionChangeListener((info) => {
       setSelection(info);
     });
-    return () => unregister();
+    window.addEventListener('focus', refreshSelection);
+    return () => {
+      unregister();
+      window.removeEventListener('focus', refreshSelection);
+    };
   }, []);
 
   // Keep the latest message in view.
@@ -127,46 +283,10 @@ export function App(): JSX.Element {
   }, [paired, status]);
 
   const handleEvent = useCallback((ev: AgentEventPayload) => {
-    switch (ev.kind) {
-      case 'text':
-        setItems((prev) => [...prev, { kind: 'assistant', text: ev.text }]);
-        break;
-      case 'tool_use':
-        setItems((prev) => [...prev, { kind: 'tool', text: `${ev.tool} ${ev.summary}`.trim() }]);
-        break;
-      case 'changeset_staged':
-        setItems((prev) => [
-          ...prev,
-          { kind: 'changeset', id: ev.changeSetId, preview: ev.preview, status: 'staged' },
-        ]);
-        break;
-      case 'changeset_applied':
-        setItems((prev) =>
-          prev.map((it) =>
-            it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: 'applied' } : it,
-          ),
-        );
-        break;
-      case 'changeset_undone':
-        setItems((prev) =>
-          prev.map((it) =>
-            it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: 'undone' } : it,
-          ),
-        );
-        break;
-      case 'error':
-        setItems((prev) => [...prev, { kind: 'error', text: ev.message }]);
-        break;
-      case 'stopped':
-        setItems((prev) => [
-          ...prev,
-          { kind: 'stopped', text: ev.reason ?? 'Generation stopped by user.' },
-        ]);
-        break;
-      case 'done':
-        setBusy(false);
-        setStopping(false);
-        break;
+    setItems((prev) => applyAgentEventToItems(prev, ev));
+    if (ev.kind === 'done') {
+      setBusy(false);
+      setStopping(false);
     }
   }, []);
 
@@ -200,29 +320,47 @@ export function App(): JSX.Element {
   }, []);
 
   const sendMessage = (): void => {
-    const text = input.trim();
-    if (!text || busy || status !== 'connected') return;
+    const rawText = input.trim();
+    if ((!rawText && !attachedFile) || busy || status !== 'connected') return;
 
-    const hasSelection = attachSelection && selection;
-    let displayText = text;
-    let payloadText = text;
-
-    if (attachedFile) {
-      displayText = `[📄 Attached File: ${attachedFile.name}]\n${displayText}`;
-      payloadText = `[Attached Document: ${attachedFile.name}]\n\`\`\`\n${attachedFile.content}\n\`\`\`\n\n${payloadText}`;
-    }
-
-    if (hasSelection) {
-      displayText = `[📎 Selection: ${selection.address}]\n${displayText}`;
-      payloadText = `[Context: Active Selection is ${selection.address} (${selection.cellCount} cells)]\n${payloadText}`;
-    }
-
-    setItems((prev) => [...prev, { kind: 'user', text: displayText }]);
     setInput('');
+    const currentFile = attachedFile;
     setAttachedFile(null);
     setBusy(true);
     setStopping(false);
-    connection.current?.sendChat(payloadText);
+
+    const text =
+      rawText ||
+      (currentFile && /\.(csv|tsv|json)$/i.test(currentFile.name)
+        ? `Import ${currentFile.name} starting at A1`
+        : currentFile
+          ? `Help me create the spreadsheet described in ${currentFile.name}`
+          : '');
+
+    void (async () => {
+      let currentSelection = selection;
+      if (attachSelection && !currentSelection) {
+        currentSelection = await getSelectedRangeInfo();
+        if (currentSelection) setSelection(currentSelection);
+      }
+
+      const hasSelection = attachSelection && currentSelection;
+      let displayText = text;
+      let payloadText = text;
+
+      if (currentFile) {
+        displayText = `[📄 Attached File: ${currentFile.name}]\n${displayText}`;
+        payloadText = `[Attached Document: ${currentFile.name} (full contents provided inline below — read directly from this message; do NOT search the filesystem for this file)]\n\`\`\`\n${currentFile.content}\n\`\`\`\n\n${payloadText}`;
+      }
+
+      if (hasSelection && currentSelection) {
+        displayText = `[📎 Selection: ${currentSelection.address}]\n${displayText}`;
+        payloadText = `[Context: Active Selection is ${currentSelection.address} (${currentSelection.cellCount} cells)]\n${payloadText}`;
+      }
+
+      setItems((prev) => [...prev, { kind: 'user', text: displayText }]);
+      connection.current?.sendChat(payloadText);
+    })();
   };
 
   if (!paired) {

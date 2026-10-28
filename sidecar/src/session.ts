@@ -88,9 +88,7 @@ export class Session {
         },
       });
       if (!abortController.signal.aborted) {
-        this.history = result.history;
-        // Bound history growth; compaction lands with the indexer work.
-        if (this.history.length > 60) this.history = this.history.slice(-40);
+        this.history = trimHistory(result.history, 24);
       }
       console.log(
         `[chat] ${this.workbookName} · ${provider.model} · ${Date.now() - startedAt}ms · tokens ${totalIn} in / ${totalOut} out${result.stagedChangeSetId ? ' · change-set staged' : ''}${abortController.signal.aborted ? ' · aborted' : ''}`,
@@ -142,4 +140,17 @@ export class Session {
       this.emit({ kind: 'error', message: e instanceof Error ? e.message : String(e) });
     }
   }
+}
+
+/**
+ * Bounds conversation history while ensuring it always starts at a `user`
+ * message boundary so `tool` messages are never orphaned from their `assistant` call.
+ */
+function trimHistory(history: ChatMessage[], maxMessages: number): ChatMessage[] {
+  if (history.length <= maxMessages) return history;
+  let start = history.length - maxMessages;
+  while (start < history.length && history[start]?.role !== 'user') {
+    start++;
+  }
+  return start < history.length ? history.slice(start) : history.slice(-maxMessages);
 }

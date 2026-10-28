@@ -35,6 +35,13 @@ export interface ChatResponse {
   toolCalls: ToolCall[];
   usage: ChatUsage;
   stopReason: 'end' | 'tool_use' | 'max_tokens' | 'other';
+  /** Optional internal chain-of-thought returned by reasoning models. */
+  reasoning?: string;
+}
+
+export interface ChatDelta {
+  reasoning?: string;
+  text?: string;
 }
 
 export interface ChatRequestOptions {
@@ -42,7 +49,10 @@ export interface ChatRequestOptions {
   tools?: ToolSpec[];
   maxTokens?: number;
   temperature?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   abortSignal?: AbortSignal;
+  /** Optional callback invoked as streaming tokens/reasoning arrive via SSE or in-process callbacks. */
+  onDelta?: (delta: ChatDelta) => void;
 }
 
 export interface Provider {

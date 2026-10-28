@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseA1, rangeHeight, rangeWidth } from './cells.js';
 
 /**
  * The workbook tool surface. These schemas are the single source of truth:
@@ -17,7 +18,7 @@ const cellWrite = z.union([
 export const toolSchemas = {
   get_workbook_map: {
     description:
-      'Get the structural map of the workbook: sheets, their used ranges and dimensions. Call this first to orient yourself.',
+      'Get the structural map of the workbook: sheets, their used ranges and dimensions. Call this only when the workbook sheets are not already provided in the system prompt.',
     parameters: z.object({}).strict(),
     readonly: true,
   },
@@ -33,14 +34,44 @@ export const toolSchemas = {
   },
   write_range: {
     description:
-      'Write values and/or formulas to a range. `cells` is a 2-D row-major array matching the range dimensions. Formulas are objects like {"formula":"=SUM(A1:A10)"}; plain values are written as-is. Writes are staged into a change-set the user reviews — they are not applied immediately.',
+      'Write a 2-D array of rows starting at a top-left cell (e.g. "Sheet1!A1"). Example: `{"range": "Sheet1!A1", "cells": [["ASSETS"], ["Cash", 401900], ["Raw Materials", 419500], ["Total", {"formula": "=SUM(B2:B3)"}]], "reason": "Add balance sheet"}`. Pass just the top-left cell like "Sheet1!A1" — the end row/column and padding for 1-cell header rows (`["ASSETS"]`) are computed automatically. Do NOT triple-nest rows (`[[["Cash", 100]]]` is wrong; use `[["Cash", 100]]`). Staged into a change-set for review.',
     parameters: z
       .object({
-        range: z.string().min(1).describe('A1-style range, e.g. "Sheet1!B2:B10"'),
+        range: z
+          .string()
+          .min(1)
+          .describe('Top-left A1 cell or target range, e.g. "Sheet1!A1" or "Sheet1!A1:B20"'),
         cells: z.array(z.array(cellWrite)).min(1),
         reason: z.string().min(1).max(300).describe('One line: why this change is being made'),
       })
-      .strict(),
+      .strict()
+      .superRefine((val, ctx) => {
+        let addr;
+        try {
+          addr = parseA1(val.range);
+        } catch (e) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['range'],
+            message: e instanceof Error ? e.message : `Invalid A1 range: ${val.range}`,
+          });
+          return;
+        }
+        const expectedRows = rangeHeight(addr);
+        const expectedCols = rangeWidth(addr);
+        if (expectedCols > 1) {
+          for (let r = 0; r < val.cells.length; r++) {
+            const row = val.cells[r]!;
+            if (row.length > expectedCols || (val.cells.length === 1 && row.length !== expectedCols)) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['cells', r],
+                message: `Row ${r + 1} has ${row.length} column(s), expected ${expectedCols} for range "${val.range}" (${expectedRows}×${expectedCols})`,
+              });
+            }
+          }
+        }
+      }),
     readonly: false,
   },
   format_range: {

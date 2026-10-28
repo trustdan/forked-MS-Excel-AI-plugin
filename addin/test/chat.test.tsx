@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ChatBubble } from '../src/taskpane/components/chat/ChatBubble.js';
 import { Composer } from '../src/taskpane/components/chat/Composer.js';
+import { ThinkingBlock } from '../src/taskpane/components/chat/ThinkingBlock.js';
+import { applyAgentEventToItems } from '../src/taskpane/App.js';
+import type { ChatItem } from '../src/taskpane/types.js';
 
 describe('Chat Components', () => {
   describe('ChatBubble', () => {
@@ -189,6 +192,135 @@ describe('Chat Components', () => {
       const detachBtn = screen.getByRole('button', { name: /Detach file/i });
       fireEvent.click(detachBtn);
       expect(setAttachedFile).toHaveBeenCalledWith(null);
+    });
+  });
+
+  describe('ThinkingBlock & Activity Drawer', () => {
+    it('starts expanded while active, auto-collapses on completion, and toggles on click', () => {
+      const steps = [
+        { kind: 'thinking' as const, text: 'Inspecting revenue columns A1:D10', durationMs: 1400 },
+        { kind: 'tool' as const, text: 'read_range Sheet1!A1:D10' },
+      ];
+
+      const { rerender } = render(
+        <ThinkingBlock steps={steps} totalDurationMs={1400} active={true} />,
+      );
+
+      // While active, it is expanded and shows Thinking… · 1 tool call
+      const toggleBtn = screen.getByRole('button', { name: /Thinking… · 1 tool call/i });
+      expect(toggleBtn.getAttribute('aria-expanded')).toBe('true');
+      expect(screen.getByText('Inspecting revenue columns A1:D10')).toBeDefined();
+      expect(screen.getByText('read_range Sheet1!A1:D10')).toBeDefined();
+
+      // When active becomes false, it auto-collapses and updates header summary
+      rerender(<ThinkingBlock steps={steps} totalDurationMs={1400} active={false} />);
+      const completedBtn = screen.getByRole('button', {
+        name: /Thought for 1\.4s · 1 tool call/i,
+      });
+      expect(completedBtn.getAttribute('aria-expanded')).toBe('false');
+      expect(screen.queryByRole('region')).toBeNull();
+
+      // Clicking the header expands the drawer to inspect thoughts & tools
+      fireEvent.click(completedBtn);
+      expect(completedBtn.getAttribute('aria-expanded')).toBe('true');
+      expect(screen.getByText('Inspecting revenue columns A1:D10')).toBeDefined();
+      expect(screen.getByText('read_range Sheet1!A1:D10')).toBeDefined();
+    });
+
+    it('groups contiguous thinking and tool_use events into a single collapsible activity item and closes it on final answer', () => {
+      let items: ChatItem[] = [{ kind: 'user', text: 'Calculate totals' }];
+
+      items = applyAgentEventToItems(items, {
+        kind: 'thinking',
+        text: 'Let me check the sheet layout.',
+        durationMs: 1200,
+      });
+      items = applyAgentEventToItems(items, {
+        kind: 'tool_use',
+        tool: 'get_workbook_map',
+        summary: '',
+      });
+      items = applyAgentEventToItems(items, {
+        kind: 'thinking',
+        text: 'Now I will read Sheet1!A1:B5.',
+        durationMs: 800,
+      });
+      items = applyAgentEventToItems(items, {
+        kind: 'tool_use',
+        tool: 'read_range',
+        summary: 'Sheet1!A1:B5',
+      });
+
+      expect(items).toHaveLength(2);
+      expect(items[1]).toEqual({
+        kind: 'activity',
+        active: true,
+        totalDurationMs: 2000,
+        steps: [
+          { kind: 'thinking', text: 'Let me check the sheet layout.', durationMs: 1200 },
+          { kind: 'tool', text: 'get_workbook_map' },
+          { kind: 'thinking', text: 'Now I will read Sheet1!A1:B5.', durationMs: 800 },
+          { kind: 'tool', text: 'read_range Sheet1!A1:B5' },
+        ],
+      });
+
+      // When assistant text arrives, the activity drawer is marked active: false
+      items = applyAgentEventToItems(items, {
+        kind: 'text',
+        text: 'The sum is 250.',
+      });
+      expect(items).toHaveLength(3);
+      expect(items[1]).toMatchObject({ kind: 'activity', active: false, totalDurationMs: 2000 });
+      expect(items[2]).toEqual({ kind: 'assistant', text: 'The sum is 250.' });
+    });
+
+    it('coalesces live thinking_delta and text_delta chunks and finalizes cleanly when thinking/text events arrive', () => {
+      let items: ChatItem[] = [{ kind: 'user', text: 'Analyze Q1' }];
+
+      // Stream reasoning tokens
+      items = applyAgentEventToItems(items, { kind: 'thinking_delta', text: 'Reading ' });
+      items = applyAgentEventToItems(items, { kind: 'thinking_delta', text: 'columns A:C…' });
+
+      expect(items).toHaveLength(2);
+      expect(items[1]).toEqual({
+        kind: 'activity',
+        active: true,
+        totalDurationMs: 0,
+        steps: [{ kind: 'thinking', text: 'Reading columns A:C…' }],
+      });
+
+      // Finalized thinking event replaces in-progress thinking step with durationMs
+      items = applyAgentEventToItems(items, {
+        kind: 'thinking',
+        text: 'Reading columns A:C…',
+        durationMs: 950,
+      });
+      expect(items[1]).toEqual({
+        kind: 'activity',
+        active: true,
+        totalDurationMs: 950,
+        steps: [{ kind: 'thinking', text: 'Reading columns A:C…', durationMs: 950 }],
+      });
+
+      // Stream assistant text tokens — closes active activity drawer and appends to streaming bubble
+      items = applyAgentEventToItems(items, { kind: 'text_delta', text: 'Q1 total ' });
+      items = applyAgentEventToItems(items, { kind: 'text_delta', text: 'is $1,200.' });
+
+      expect(items).toHaveLength(3);
+      expect(items[1]).toMatchObject({ kind: 'activity', active: false, totalDurationMs: 950 });
+      expect(items[2]).toEqual({
+        kind: 'assistant',
+        text: 'Q1 total is $1,200.',
+        streaming: true,
+      });
+
+      // Finalized text event replaces streaming bubble cleanly
+      items = applyAgentEventToItems(items, { kind: 'text', text: 'Q1 total is $1,200.' });
+      expect(items).toHaveLength(3);
+      expect(items[2]).toEqual({
+        kind: 'assistant',
+        text: 'Q1 total is $1,200.',
+      });
     });
   });
 });

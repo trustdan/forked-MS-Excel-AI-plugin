@@ -147,4 +147,69 @@ describe('import_local_data tool integration', () => {
     expect(mdBody.totalRows).toBe(3);
     expect(mdBody.headers).toEqual(['Name', 'Role']);
   });
+
+  it('handles import_local_data for inline [Attached Document] narrative markdown and CSV without disk file', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const events: AgentEvent[] = [];
+
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'import_local_data',
+            args: {
+              filePath: 'pax-vans.md',
+              reason: 'Import attached Pax Vans case document',
+            },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1:B2',
+              cells: [
+                ['Metric', 'Value'],
+                ['Standard Vans', 12],
+              ],
+              reason: 'Create Pax Vans model from attached case study',
+            },
+          },
+        ],
+      },
+      { text: 'Created the Pax Vans model on Sheet1.' },
+    ]);
+
+    const attachedMsg = [
+      '[Context: Active Selection is Sheet1!A1 (1 cells)]',
+      '[Attached Document: pax-vans.md (full contents provided inline below — read directly from this message; do NOT search the filesystem for this file)]',
+      '```',
+      '# Pax Vans Case Study',
+      'Pax Vans operates a fleet of 12 standard vans and needs a financial model showing monthly revenue and maintenance costs.',
+      'Build a clean spreadsheet model starting at A1.',
+      '```',
+      '',
+      'Can you help me create the spreadsheet called for here',
+    ].join('\n');
+
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book 2026-10-28.xlsx',
+      history: [],
+      userMessage: attachedMsg,
+      onEvent: (ev) => events.push(ev),
+    });
+
+    // First tool call should return alreadyInContext: true instead of File not found
+    const firstToolReply = provider.requests.at(1)?.messages.findLast((m) => m.role === 'tool');
+    expect(firstToolReply && 'content' in firstToolReply ? firstToolReply.content : '').toContain(
+      'alreadyInContext',
+    );
+    expect(result.stagedChangeSetId).toBeDefined();
+  });
 });

@@ -224,5 +224,43 @@ describe('Embedded LLaMA Provider & Local GGUF Engine', () => {
         }),
       ).rejects.toThrow(/AbortError/);
     });
+
+    it('streams token-by-token reasoning and text deltas via onDelta in EmbeddedLlamaProvider', async () => {
+      const dummyPath = join(tempDir, 'qwen.gguf');
+      writeFileSync(dummyPath, 'mock-gguf');
+
+      const chunks = [
+        '<think>Analyzing ',
+        'columns A and B</think>',
+        'The sum ',
+        'is 100.',
+      ];
+      const mockBackend = new MockLlamaBackend(async (_prompt, _signal, onToken) => {
+        for (const c of chunks) {
+          onToken?.(c);
+        }
+        return chunks.join('');
+      });
+
+      const provider = new EmbeddedLlamaProvider(
+        { kind: 'embedded', model: dummyPath },
+        { backend: mockBackend },
+      );
+
+      const reasoningDeltas: string[] = [];
+      const textDeltas: string[] = [];
+      const res = await provider.chat({
+        messages: [{ role: 'user', content: 'Sum A and B' }],
+        onDelta: (d) => {
+          if (d.reasoning) reasoningDeltas.push(d.reasoning);
+          if (d.text) textDeltas.push(d.text);
+        },
+      });
+
+      expect(reasoningDeltas.join('')).toBe('Analyzing columns A and B');
+      expect(textDeltas.join('')).toBe('The sum is 100.');
+      expect(res.reasoning).toBe('Analyzing columns A and B');
+      expect(res.text).toBe('The sum is 100.');
+    });
   });
 });

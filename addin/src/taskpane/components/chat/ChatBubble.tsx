@@ -1,6 +1,7 @@
 import { Markdown } from '../../Markdown.js';
 import type { ChatItem } from '../../types.js';
 import { ChangeSetCard } from '../changeset/ChangeSetCard.js';
+import { ThinkingBlock } from './ThinkingBlock.js';
 
 export interface ChatBubbleProps {
   item: ChatItem;
@@ -23,6 +24,22 @@ export function ChatBubble({
         <div className="bubble assistant">
           <Markdown content={item.text} />
         </div>
+      );
+    case 'thinking':
+      return (
+        <ThinkingBlock
+          steps={[{ kind: 'thinking', text: item.text, durationMs: item.durationMs }]}
+          totalDurationMs={item.durationMs ?? 0}
+          active={item.active ?? false}
+        />
+      );
+    case 'activity':
+      return (
+        <ThinkingBlock
+          steps={item.steps}
+          totalDurationMs={item.totalDurationMs}
+          active={item.active}
+        />
       );
     case 'tool':
       return <div className="toolnote">🔧 {item.text}</div>;

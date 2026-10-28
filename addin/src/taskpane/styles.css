@@ -250,6 +250,134 @@ header .ghost ~ .ghost {
   line-height: 1;
 }
 
+/* ---------- collapsible thinking & activity drawer ---------- */
+
+.thinking-block {
+  align-self: stretch;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.thinking-block.active {
+  border-color: var(--accent-border);
+}
+
+.thinking-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+
+.thinking-header:hover {
+  background: rgba(128, 128, 128, 0.06);
+  color: var(--text);
+}
+
+.thinking-chevron {
+  font-size: 10px;
+  color: var(--text-3);
+  width: 10px;
+  flex-shrink: 0;
+}
+
+.thinking-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.thinking-block.active .thinking-icon {
+  color: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.thinking-summary {
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.thinking-preview {
+  color: var(--text-3);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  margin-left: 4px;
+}
+
+.thinking-body {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.thinking-step {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.thinking-step-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  flex: 1;
+  min-width: 0;
+}
+
+.thinking-step-duration {
+  font-size: 10px;
+  color: var(--text-3);
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+
+.thinking-tool-step {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-2);
+  padding: 2px 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.thinking-tool-icon {
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.thinking-tool-text {
+  font-family: ui-monospace, 'Cascadia Code', 'Segoe UI Mono', monospace;
+  font-size: 11px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
 .toolnote {
   font-size: 11px;
   color: var(--text-3);
