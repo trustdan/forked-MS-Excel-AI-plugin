@@ -172,14 +172,24 @@ export function connect(options: {
     })();
   };
 
-  const send = (type: string, payload: unknown): void => {
+  const send = (type: string, payload: unknown): boolean => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(makeEnvelope(type, payload)));
+      return true;
     }
+    return false;
   };
 
   return {
-    sendChat: (message) => send('chat', { message }),
+    sendChat: (message) => {
+      if (!send('chat', { message })) {
+        options.onEvent({
+          kind: 'error',
+          message: 'Connection to the local sidecar was interrupted. Please try sending again once reconnected.',
+        });
+        options.onEvent({ kind: 'done' });
+      }
+    },
     abort: (reason) => send('abort', { reason }),
     approve: (changeSetId) => send('approve_changeset', { changeSetId }),
     reject: (changeSetId) => send('reject_changeset', { changeSetId }),

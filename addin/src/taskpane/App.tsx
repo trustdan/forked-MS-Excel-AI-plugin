@@ -95,6 +95,53 @@ function appendTextDelta(items: ChatItem[], delta: string): ChatItem[] {
 function appendActivityStep(items: ChatItem[], step: ActivityStep): ChatItem[] {
   const addDuration = step.kind === 'thinking' ? (step.durationMs ?? 0) : 0;
   const last = items[items.length - 1];
+
+  // When text_delta has already started a streaming assistant bubble at the end of items,
+  // attach finalized thinking/tool events to the activity block preceding the streaming bubble
+  // so the streaming bubble remains last and is replaced (not duplicated) by the final text event.
+  if (last && last.kind === 'assistant' && last.streaming) {
+    const beforeStreaming = items.slice(0, -1);
+    const prevItem = beforeStreaming[beforeStreaming.length - 1];
+    if (prevItem && prevItem.kind === 'activity') {
+      const prevStep = prevItem.steps[prevItem.steps.length - 1];
+      if (
+        step.kind === 'thinking' &&
+        prevStep &&
+        prevStep.kind === 'thinking' &&
+        prevStep.durationMs === undefined
+      ) {
+        return [
+          ...beforeStreaming.slice(0, -1),
+          {
+            ...prevItem,
+            steps: [...prevItem.steps.slice(0, -1), step],
+            totalDurationMs: prevItem.totalDurationMs + addDuration,
+          },
+          last,
+        ];
+      }
+      return [
+        ...beforeStreaming.slice(0, -1),
+        {
+          ...prevItem,
+          steps: [...prevItem.steps, step],
+          totalDurationMs: prevItem.totalDurationMs + addDuration,
+        },
+        last,
+      ];
+    }
+    return [
+      ...beforeStreaming,
+      {
+        kind: 'activity',
+        steps: [step],
+        totalDurationMs: addDuration,
+        active: false,
+      },
+      last,
+    ];
+  }
+
   if (last && last.kind === 'activity' && last.active) {
     const lastStep = last.steps[last.steps.length - 1];
     // Finalize an in-flight streamed thinking step when the completed thinking event arrives
@@ -303,6 +350,11 @@ export function App(): JSX.Element {
           onStatus: (s, detail) => {
             setStatus(s === 'connected' ? 'connected' : s);
             setStatusDetail(detail ?? '');
+            if (s === 'disconnected' || s === 'error') {
+              setBusy(false);
+              setStopping(false);
+              setItems((prev) => closeActiveActivities(prev));
+            }
           },
         });
         connection.current = conn;

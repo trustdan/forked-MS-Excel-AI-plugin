@@ -7,11 +7,12 @@ import { parseA1, rangeHeight, rangeWidth } from './cells.js';
  * and both the Office.js bridge and the headless emulator implement them.
  */
 
-const cellScalar = z.union([z.string(), z.number(), z.boolean(), z.null()]);
-
 /** A cell write: either a literal value or a canonical en-US formula. */
 const cellWrite = z.union([
-  cellScalar,
+  z.string(),
+  z.number(),
+  z.boolean(),
+  z.null(),
   z.object({ formula: z.string().startsWith('=') }).strict(),
 ]);
 

@@ -601,4 +601,152 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(wb.getValue('Sheet1!A3')).toBe('Raw Materials');
     expect(wb.getValue('Sheet1!B3')).toBe(419500);
   });
+
+  it('auto-balances missing parens, repairs off-by-one SUM/subtotal rows in write_range, replaces same-start-cell drafts, and stops multi-pass rewrite loops', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const provider = new ScriptedProvider([
+      // Attempt 1: 31 rows with missing closing paren "=SUM(B7:B10"
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1',
+              cells: [
+                ['Pax Vans'],
+                ['Balance Sheet'],
+                ['As of December 31, 2024'],
+                [''],
+                ['ASSETS:'],
+                ['Current Assets:'],
+                ['Cash', 401900],
+                ['Raw Materials', 419500],
+                ['WIP Inventory', 0],
+                ['FG Inventory', 0],
+                ['Total Current Assets', { formula: '=SUM(B7:B10' }],
+              ],
+              reason: 'Initial draft',
+            },
+          },
+        ],
+      },
+      // Attempt 2: 33 rows at Sheet1!A1 with off-by-one liabilities/equity formulas (=SUM(B22:B23), =B24, =SUM(B28:B29), =B25+B30)
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1',
+              cells: [
+                ['Pax Vans'],
+                ['Balance Sheet'],
+                ['As of December 31, 2024'],
+                [''],
+                ['ASSETS:'],
+                ['Current Assets:'],
+                ['Cash', 401900],
+                ['Raw Materials', 419500],
+                ['WIP Inventory', 0],
+                ['FG Inventory', 0],
+                ['Total Current Assets', { formula: '=SUM(B7:B10' }],
+                [''],
+                ['Non-Current Assets:'],
+                ['Property, Plant and Equipment:'],
+                ['Rental Vans', 469700],
+                ['Manufacturing Equipment, net', 165000],
+                ['Property, Plant, and Equip, Net', { formula: '=SUM(B15:B16' }],
+                [''],
+                ['TOTAL ASSETS', { formula: '=SUM(B11,B17)' }],
+                [''],
+                ['LIABILITIES:'],
+                ['Current Liabilities:'],
+                ['Accounts Payable', 220400],
+                ['Deferred Revenue (Customer Deposits)', 122500],
+                ['Total Current Liabilities', { formula: '=SUM(B22:B23)' }],
+                [''],
+                ['TOTAL LIABILITIES', { formula: '=B24' }],
+                [''],
+                ["SHAREHOLDERS' EQUITY:"],
+                ['Common Stock', 1250000],
+                ['Retained Earnings (Loss)', -136800],
+                ["TOTAL SHAREHOLDERS' EQUITY", { formula: '=SUM(B28:B29)' }],
+                ["TOTAL LIAB. & SHAREHOLDERS' EQUITY", { formula: '=B25+B30' }],
+              ],
+              reason: 'Create baseline balance sheet as of 12/31/2024',
+            },
+          },
+        ],
+      },
+      { text: 'Staged the baseline balance sheet as of December 31, 2024.' },
+    ]);
+
+    const { stagedId, changeSets } = await runScript(wb, provider);
+    expect(stagedId).toBeDefined();
+
+    // Attempt 2 replaced Attempt 1 (despite 11 rows vs 33 rows) so stagedOpsCount stayed 1
+    const cs = changeSets.get(stagedId!)!;
+    expect(cs.ops).toHaveLength(1);
+    expect(cs.ops[0]?.kind === 'write_range' ? cs.ops[0].range : '').toBe('Sheet1!A1:B33');
+
+    // Step 3 had tools disabled to prevent a 3rd/4th write_range rewrite loop
+    expect(provider.requests.at(2)?.tools).toBeUndefined();
+
+    // Apply and verify that all formulas were balanced and off-by-one rows repaired
+    const applied = await changeSets.apply(stagedId!);
+    expect(applied.ok).toBe(true);
+    expect(wb.getValue('Sheet1!B11')).toBe(821400); // =SUM(B7:B10)
+    expect(wb.getValue('Sheet1!B17')).toBe(634700); // =SUM(B15:B16)
+    expect(wb.getValue('Sheet1!B19')).toBe(1456100); // =SUM(B11,B17)
+    expect(wb.getValue('Sheet1!B25')).toBe(342900); // repaired from =SUM(B22:B23) -> =SUM(B23:B24)
+    expect(wb.getValue('Sheet1!B27')).toBe(342900); // repaired from =B24 -> =B25
+    expect(wb.getValue('Sheet1!B32')).toBe(1113200); // repaired from =SUM(B28:B29) -> =SUM(B30:B31)
+    expect(wb.getValue('Sheet1!B33')).toBe(1456100); // repaired from =B25+B30 -> =B27+B32
+  });
+
+  it('deduplicates repeated [Attached Document] blocks across multi-turn history so Turn 2+ does not overflow local model context', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const attachedPayload = `[Attached Document: pax-vans.md (full contents provided inline below — read directly from this message; do NOT search the filesystem for this file)]\n\`\`\`\n# Pax Vans Case\nCash: 401,900\nRaw Materials: 419,500\n\`\`\``;
+
+    const priorHistory = [
+      {
+        role: 'user' as const,
+        content: `${attachedPayload}\n\ncan you help me draft starting balances?`,
+      },
+      {
+        role: 'assistant' as const,
+        content: 'Got it — before I transform this, I need the 2025 transaction data.',
+      },
+    ];
+
+    const provider = new ScriptedProvider([{ text: 'Here is the 2025 transaction schedule.' }]);
+    const events: AgentEvent[] = [];
+
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book.xlsx',
+      history: priorHistory,
+      userMessage: `${attachedPayload}\n\nHelp me create the spreadsheet described in pax-vans.md`,
+      onEvent: (ev) => events.push(ev),
+    });
+
+    const sentMessages = provider.requests.at(0)?.messages ?? [];
+    const turn1UserMsg = sentMessages.find(
+      (m) => m.role === 'user' && m.content.includes('can you help me draft starting balances?'),
+    );
+    const turn2UserMsg = sentMessages.find(
+      (m) =>
+        m.role === 'user' &&
+        m.content.includes('Help me create the spreadsheet described in pax-vans.md'),
+    );
+
+    expect(turn1UserMsg?.content).toContain(
+      '[Attached Document: pax-vans.md — full contents included in latest message below]',
+    );
+    expect(turn1UserMsg?.content).not.toContain('Cash: 401,900');
+    expect(turn2UserMsg?.content).toContain('Cash: 401,900');
+    expect(result.history).toHaveLength(4);
+  });
 });

@@ -489,4 +489,24 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
     expect(res.stopReason).toBe('tool_use');
     expect(res.usage).toEqual({ inputTokens: 15, outputTokens: 28 });
   });
+
+  it('salvages streamed reasoning and returns stopReason max_tokens instead of crashing when an SSE stream hits a 413 buffer overflow', async () => {
+    const giantLineWithoutNewline = 'data: {"choices":[{"delta":{"content":"' + 'x'.repeat(9 * 1024 * 1024);
+    vi.stubGlobal('fetch', async () =>
+      createSseResponse([
+        'data: {"choices":[{"delta":{"reasoning_content":"Drafted balance sheet rows 1..33."}}]}\n\n',
+        giantLineWithoutNewline,
+      ]),
+    );
+
+    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const deltas: ChatDelta[] = [];
+    const res = await p.chat({
+      messages: [{ role: 'user', content: 'draft balance sheet' }],
+      onDelta: (d) => deltas.push(d),
+    });
+
+    expect(res.stopReason).toBe('max_tokens');
+    expect(res.reasoning).toBe('Drafted balance sheet rows 1..33.');
+  });
 });

@@ -42,6 +42,7 @@ export interface ChatResponse {
 export interface ChatDelta {
   reasoning?: string;
   text?: string;
+  toolCallName?: string;
 }
 
 export interface ChatRequestOptions {

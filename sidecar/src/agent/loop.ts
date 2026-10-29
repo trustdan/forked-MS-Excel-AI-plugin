@@ -5,6 +5,7 @@ import {
   toolSchemas,
   isWriteTool,
   colToIndex,
+  indexToCol,
   formatA1,
   parseA1,
   type ChangeOp,
@@ -108,10 +109,18 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
     return cachedMap;
   };
 
+  let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    cachedMap = await executor.getWorkbookMap();
+    cachedMap = await Promise.race([
+      executor.getWorkbookMap(),
+      new Promise<null>((resolvePrefetch) => {
+        prefetchTimer = setTimeout(() => resolvePrefetch(null), 3_000);
+      }),
+    ]);
   } catch {
     // Non-fatal: if pre-fetching the map fails, tools can still fetch it on demand
+  } finally {
+    if (prefetchTimer !== undefined) clearTimeout(prefetchTimer);
   }
 
   let system = buildSystemPrompt(workbookName, cachedMap);
@@ -132,6 +141,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
 
   const pendingOps: ChangeOp[] = [];
   const seenCalls = new Map<string, { count: number; lastResult: string }>();
+  const writeRangeStartHistory = new Set<string>();
   const duplicateAssistantIndices = new Set<number>();
   const duplicateToolCallIds = new Set<string>();
   const recoveryMessageIndices = new Set<number>();
@@ -140,7 +150,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
   let reasoningRecoveryCount = 0;
   const MAX_REASONING_RECOVERY_ATTEMPTS = 2;
   const RECOVERY_NUDGE =
-    '[System note: Your previous completion ran out of tokens during internal reasoning without emitting a tool call or reply. Do not deliberate, recount rows, or repeat layout options — immediately emit your next tool call (e.g. write_range starting at "Sheet1!A1") or final summary concisely.]';
+    '[System note: Your previous completion ran out of tokens or hit a JSON formatting loop before finishing the tool call. Do not deliberate, recount rows, or pretty-print — immediately emit your next tool call (e.g. write_range starting at "Sheet1!A1") as compact single-line JSON with no extra whitespace, or reply with your final summary concisely.]';
   const emit = (ev: AgentEvent): void => {
     if (ev.kind !== 'thinking' && ev.kind !== 'thinking_delta') {
       emittedAnything = true;
@@ -160,14 +170,17 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
 
     const stepMaxTokens = reasoningRecoveryCount > 0 ? 16384 : 8192;
     const stepStartedAt = Date.now();
+    let streamedThinkingInStep = false;
+    let announcedToolStream = false;
 
     let response;
+    const providerMessages = prepareMessagesForProvider(messages, 1 + options.history.length);
     try {
       response = await withRetry(() =>
         provider.chat({
-          messages,
+          messages: providerMessages,
           tools: provider.supportsTools && !disableToolsForStep ? specs : undefined,
-          temperature: 0,
+          temperature: reasoningRecoveryCount > 0 ? 0.2 : 0,
           reasoningEffort: 'low',
            // Generous budget for reasoning + large write_range tool calls,
           // expanded further when recovering from reasoning token exhaustion.
@@ -176,7 +189,15 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
           onDelta: (delta) => {
             if (abortSignal?.aborted) return;
             if (delta.reasoning) {
+              streamedThinkingInStep = true;
               emit({ kind: 'thinking_delta', text: delta.reasoning });
+            }
+            if (delta.toolCallName && !announcedToolStream && !streamedThinkingInStep) {
+              announcedToolStream = true;
+              emit({
+                kind: 'thinking_delta',
+                text: `Preparing ${delta.toolCallName} tool call…`,
+              });
             }
             if (delta.text) {
               emit({ kind: 'text_delta', text: delta.text });
@@ -217,6 +238,12 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
       .join('\n\n');
     if (thinkingText.length > 0) {
       emit({ kind: 'thinking', text: thinkingText, durationMs: stepDurationMs });
+    } else if (announcedToolStream) {
+      emit({
+        kind: 'thinking',
+        text: `Prepared ${toolCalls[0]?.name ?? 'tool'} call.`,
+        durationMs: stepDurationMs,
+      });
     }
 
     // Fallback tool-call extraction: local models on OpenAI-compatible servers
@@ -305,6 +332,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
     const assistantMsgIdx = messages.length;
     messages.push({ role: 'assistant', content: assistantText, toolCalls });
 
+    const priorWriteStarts = new Set(writeRangeStartHistory);
     let allCallsInStepWereDuplicates = true;
     for (const call of toolCalls) {
       if (abortSignal?.aborted) {
@@ -342,6 +370,17 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
           emit,
           options.mcpManager,
           abortSignal,
+          (normalizedArgsJson, writeStartKey) => {
+            call.argsJson = normalizedArgsJson;
+            if (writeStartKey) {
+              if (priorWriteStarts.has(writeStartKey)) {
+                // Model already wrote to this start cell in an earlier step and is re-staging;
+                // accept this revision and force the final text reply next so it cannot loop indefinitely.
+                forceTextReplyNext = true;
+              }
+              writeRangeStartHistory.add(writeStartKey);
+            }
+          },
         );
       } catch (e) {
         if (
@@ -415,6 +454,7 @@ async function executeToolCall(
   onEvent: (ev: AgentEvent) => void,
   mcpManager?: McpManager,
   abortSignal?: AbortSignal,
+  onArgsNormalized?: (normalizedArgsJson: string, writeStartKey?: string) => void,
 ): Promise<string> {
   if (mcpManager?.hasTool(name)) {
     let rawArgs: Record<string, unknown> = {};
@@ -454,19 +494,11 @@ async function executeToolCall(
     if (typeof rec.range === 'string' && rec.range.trim().length > 0) {
       rec.range = await normalizeRangeForWorkbook(rec.range, workbookName, getCachedMap);
     }
-    // Unwrap accidental 3-D nesting in write_range cells (e.g. [[["Cash", 401900]]] -> [["Cash", 401900]])
     if (toolName === 'write_range' && Array.isArray(rec.cells)) {
-      rec.cells = (rec.cells as unknown[]).map((row) => {
-        let current = row;
-        while (
-          Array.isArray(current) &&
-          current.length === 1 &&
-          Array.isArray(current[0])
-        ) {
-          current = current[0];
-        }
-        return current;
-      });
+      rec.cells = repairWriteRangeCells(
+        typeof rec.range === 'string' ? rec.range : 'Sheet1!A1',
+        rec.cells as unknown[],
+      );
     }
   }
 
@@ -577,18 +609,45 @@ async function executeToolCall(
       }
       const op = toChangeOp(toolName, args);
       if (op.kind === 'write_range') {
-        const normalizedTarget = formatA1(parseA1(op.range));
-        const existingIdx = pendingOps.findIndex(
-          (p) => p.kind === 'write_range' && formatA1(parseA1(p.range)) === normalizedTarget,
-        );
-        if (existingIdx >= 0) {
+        const opAddr = parseA1(op.range);
+        const startKey = `${opAddr.sheet.toLowerCase()}!R${opAddr.startRow}C${opAddr.startCol}`;
+        onArgsNormalized?.(JSON.stringify(args), startKey);
+        const startCellA1 = formatA1({
+          sheet: opAddr.sheet,
+          startRow: opAddr.startRow,
+          startCol: opAddr.startCol,
+          endRow: opAddr.startRow,
+          endCol: opAddr.startCol,
+        });
+        const existingIdx = pendingOps.findIndex((p) => {
+          if (p.kind !== 'write_range') return false;
+          const pAddr = parseA1(p.range);
+          return (
+            pAddr.sheet.toLowerCase() === opAddr.sheet.toLowerCase() &&
+            pAddr.startRow === opAddr.startRow &&
+            pAddr.startCol === opAddr.startCol
+          );
+        });
+        const replacedPriorDraft = existingIdx >= 0;
+        if (replacedPriorDraft) {
           pendingOps[existingIdx] = op;
         } else {
           pendingOps.push(op);
         }
-      } else {
-        pendingOps.push(op);
+        const rowsStaged = op.cells.length;
+        const colsStaged = op.cells[0]?.length ?? 0;
+        return JSON.stringify({
+          ok: true,
+          staged: true,
+          targetRange: op.range,
+          rowsStaged,
+          colsStaged,
+          replacedPriorDraft,
+          stagedOpsCount: pendingOps.length,
+          note: `Staged ${rowsStaged}×${colsStaged} table at ${op.range} into the pending change-set${replacedPriorDraft ? ` (replaced prior draft at ${startCellA1})` : ''}. All formulas are balanced and valid. Do NOT call write_range on ${startCellA1} again — reply to the user with a concise summary to finish (or call format_range once if formatting is needed).`,
+        });
       }
+      pendingOps.push(op);
       return JSON.stringify({
         ok: true,
         staged: true,
@@ -657,6 +716,81 @@ function findAttachedDocument(
     return allFound[0]!;
   }
   return null;
+}
+
+/**
+ * Prepares conversation messages for the LLM provider without mutating `messages`:
+ * 1. Deduplicates repeated `[Attached Document: <name>...]` blocks across multi-turn
+ *    history so re-attaching the same file on Turn 2+ does not double/triple prompt tokens
+ *    and stall local model context windows.
+ * 2. Compacts oversized `write_range` `argsJson` payloads from prior turns (`idx < priorHistoryEndIdx`)
+ *    so subsequent turns retain the target range, top/bottom rows, and reason without re-sending
+ *    thousands of tokens of historical 2D cell arrays.
+ */
+function prepareMessagesForProvider(
+  messages: ChatMessage[],
+  priorHistoryEndIdx: number,
+): ChatMessage[] {
+  const seenDocsFromNewest = new Set<string>();
+  const docBlockRe = /\[Attached Document:\s*([^\n\]]+?)\]\r?\n```[^\r\n]*\r?\n[\s\S]*?\r?\n```/g;
+
+  const prepared: ChatMessage[] = new Array(messages.length);
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!;
+    if (msg.role === 'user' && msg.content.includes('[Attached Document:')) {
+      const updatedContent = msg.content.replace(docBlockRe, (fullBlock, rawHeader: string) => {
+        const cleanName = rawHeader.replace(/\s*\(full contents.*$/i, '').trim();
+        const key = cleanName.toLowerCase();
+        if (!key) return fullBlock;
+        if (seenDocsFromNewest.has(key)) {
+          return `[Attached Document: ${cleanName} — full contents included in latest message below]`;
+        }
+        seenDocsFromNewest.add(key);
+        return fullBlock;
+      });
+      prepared[i] = updatedContent !== msg.content ? { ...msg, content: updatedContent } : msg;
+      continue;
+    }
+
+    if (
+      msg.role === 'assistant' &&
+      i < priorHistoryEndIdx &&
+      msg.toolCalls &&
+      msg.toolCalls.length > 0
+    ) {
+      let changed = false;
+      const compactedCalls = msg.toolCalls.map((tc) => {
+        if (tc.name !== 'write_range' || tc.argsJson.length <= 1200) return tc;
+        try {
+          const parsed = JSON.parse(tc.argsJson) as Record<string, unknown>;
+          if (!Array.isArray(parsed.cells) || parsed.cells.length <= 8) return tc;
+          const totalRows = parsed.cells.length;
+          const omitted = totalRows - 6;
+          const compactCells = [
+            ...parsed.cells.slice(0, 3),
+            [`... (${omitted} middle rows omitted from prior turn history; total ${totalRows} rows)`],
+            ...parsed.cells.slice(-3),
+          ];
+          changed = true;
+          return {
+            ...tc,
+            argsJson: JSON.stringify({
+              ...parsed,
+              cells: compactCells,
+            }),
+          };
+        } catch {
+          return tc;
+        }
+      });
+      prepared[i] = changed ? { ...msg, toolCalls: compactedCalls } : msg;
+      continue;
+    }
+
+    prepared[i] = msg;
+  }
+
+  return prepared;
 }
 
 function toChangeOp(name: ToolName, args: Record<string, unknown>): ChangeOp {
@@ -910,6 +1044,217 @@ function tryExtractToolCallFromReasoning(
     };
   }
   return null;
+}
+
+/**
+ * Auto-balances missing closing parentheses in formula strings emitted by
+ * local models (e.g. `"=SUM(B7:B10"` -> `"=SUM(B7:B10)"`).
+ */
+function balanceFormulaParens(formula: string): string {
+  const trimmed = formula.trim();
+  const withEq = trimmed.startsWith('=') ? trimmed : `=${trimmed}`;
+  let open = 0;
+  let inQuotes = false;
+  for (let i = 0; i < withEq.length; i++) {
+    const ch = withEq[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (!inQuotes) {
+      if (ch === '(') open++;
+      else if (ch === ')' && open > 0) open--;
+    }
+  }
+  return open > 0 ? `${withEq}${')'.repeat(open)}` : withEq;
+}
+
+/**
+ * Normalizes `write_range` cells before validation and staging:
+ * 1. Unwraps accidental 3-D single-row array nesting (`[[["Cash", 401900]]]` -> `[["Cash", 401900]]`).
+ * 2. Auto-balances missing closing parentheses on `{ formula }` cells (`"=SUM(B7:B10"` -> `"=SUM(B7:B10)"`).
+ * 3. Repairs off-by-one vertical `SUM(ColA:ColB)` and downstream subtotal references caused when
+ *    models miscount blank spacer rows (`[""]`) inside a multi-section statement.
+ */
+function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[] {
+  const rows = rawCells.map((row) => {
+    let current = row;
+    while (Array.isArray(current) && current.length === 1 && Array.isArray(current[0])) {
+      current = current[0];
+    }
+    if (!Array.isArray(current)) return current;
+    return current.map((cell) => {
+      if (
+        typeof cell === 'object' &&
+        cell !== null &&
+        'formula' in cell &&
+        typeof (cell as { formula: unknown }).formula === 'string'
+      ) {
+        return {
+          ...cell,
+          formula: balanceFormulaParens((cell as { formula: string }).formula),
+        };
+      }
+      return cell;
+    });
+  });
+
+  let addr;
+  try {
+    addr = parseA1(rangeStr);
+  } catch {
+    return rows;
+  }
+
+  const baseRow = addr.startRow + 1; // 1-based sheet row for rows[0]
+  const maxCols = Math.max(0, ...rows.map((r) => (Array.isArray(r) ? r.length : 0)));
+
+  const sumRangeRe =
+    /^=\s*SUM\(\s*(\$?)([A-Za-z]{1,3})(\$?)(\d+)\s*:\s*(\$?)([A-Za-z]{1,3})(\$?)(\d+)\s*\)$/i;
+  const singleRefRe = /^=\s*(\$?)([A-Za-z]{1,3})(\$?)(\d+)\s*$/i;
+
+  for (let c = 0; c < maxCols; c++) {
+    const colLetter = indexToCol(addr.startCol + c).toUpperCase();
+    const getCell = (sheetRow: number): unknown => {
+      const idx = sheetRow - baseRow;
+      if (idx < 0 || idx >= rows.length) return undefined;
+      const r = rows[idx];
+      return Array.isArray(r) ? r[c] : undefined;
+    };
+    const isNumericCell = (sheetRow: number): boolean => typeof getCell(sheetRow) === 'number';
+    const isFormulaCell = (sheetRow: number): boolean => {
+      const v = getCell(sheetRow);
+      return (
+        typeof v === 'object' &&
+        v !== null &&
+        'formula' in v &&
+        typeof (v as { formula: unknown }).formula === 'string'
+      );
+    };
+    const isEmptyCell = (sheetRow: number): boolean => {
+      const v = getCell(sheetRow);
+      return v === undefined || v === null || v === '';
+    };
+
+    const mentalToActualSubtotalRow = new Map<number, number>();
+    const passThroughSubtotalRow = new Map<number, number>();
+    const summedDetailRows = new Set<number>();
+
+    for (let r = 0; r < rows.length; r++) {
+      const actualRow = baseRow + r;
+      const rowArr = rows[r];
+      if (!Array.isArray(rowArr) || !isFormulaCell(actualRow)) continue;
+      const formulaObj = rowArr[c] as { formula: string };
+      const formula = formulaObj.formula;
+
+      // 1. Check vertical =SUM(Col<sRow>:Col<eRow>)
+      const sumMatch = sumRangeRe.exec(formula);
+      if (
+        sumMatch &&
+        sumMatch[2]!.toUpperCase() === colLetter &&
+        sumMatch[6]!.toUpperCase() === colLetter
+      ) {
+        const sRow = parseInt(sumMatch[4]!, 10);
+        const eRow = parseInt(sumMatch[8]!, 10);
+
+        const numEnd = actualRow - 1;
+        let numStart = numEnd + 1;
+        while (numStart - 1 >= baseRow && isNumericCell(numStart - 1)) {
+          numStart--;
+        }
+
+        if (numStart <= numEnd) {
+          if (sRow === numStart && eRow === numEnd) {
+            for (let k = numStart; k <= numEnd; k++) summedDetailRows.add(k);
+          } else if (
+            sRow <= eRow &&
+            eRow < actualRow &&
+            eRow - sRow === numEnd - numStart &&
+            Math.abs(numEnd - eRow) <= 5 &&
+            (eRow < numEnd ||
+              Array.from({ length: eRow - sRow + 1 }, (_, i) => sRow + i).some((k) =>
+                isEmptyCell(k),
+              ))
+          ) {
+            rowArr[c] = {
+              formula: `=SUM(${sumMatch[1]}${colLetter}${sumMatch[3]}${numStart}:${sumMatch[5]}${colLetter}${sumMatch[7]}${numEnd})`,
+            };
+            for (let k = numStart; k <= numEnd; k++) summedDetailRows.add(k);
+            // The model thought the detail block ended at eRow, so it thought this subtotal row was at eRow + 1
+            mentalToActualSubtotalRow.set(eRow + 1, actualRow);
+          }
+        }
+        continue;
+      }
+
+      // 2. Check single-cell pass-through subtotal =Col<refRow> (e.g. =B24 on TOTAL LIABILITIES)
+      const singleMatch = singleRefRe.exec(formula);
+      if (singleMatch && singleMatch[2]!.toUpperCase() === colLetter) {
+        const refRow = parseInt(singleMatch[4]!, 10);
+        const mappedRow = mentalToActualSubtotalRow.get(refRow);
+        if (
+          mappedRow !== undefined &&
+          mappedRow < actualRow &&
+          (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
+          isFormulaCell(mappedRow)
+        ) {
+          rowArr[c] = {
+            formula: `=${singleMatch[1]}${colLetter}${singleMatch[3]}${mappedRow}`,
+          };
+          passThroughSubtotalRow.set(mappedRow, actualRow);
+        } else if (isFormulaCell(refRow) && refRow < actualRow) {
+          passThroughSubtotalRow.set(refRow, actualRow);
+        }
+        continue;
+      }
+
+      // 3. Check multi-cell subtotal formulas (e.g. =B25+B30) when earlier subtotals shifted
+      if (mentalToActualSubtotalRow.size > 0) {
+        const cellTokenRe = /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:)/g;
+        let hasShiftedSubtotalRef = false;
+        let m: RegExpExecArray | null;
+        while ((m = cellTokenRe.exec(formula)) !== null) {
+          if (m[3]!.toUpperCase() !== colLetter) continue;
+          const refRow = parseInt(m[5]!, 10);
+          const mapped = mentalToActualSubtotalRow.get(refRow);
+          if (
+            mapped !== undefined &&
+            mapped < actualRow &&
+            (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
+            isFormulaCell(mapped)
+          ) {
+            hasShiftedSubtotalRef = true;
+            break;
+          }
+        }
+
+        if (hasShiftedSubtotalRef) {
+          const repaired = formula.replace(
+            /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:)/g,
+            (full, prefix: string, d1: string, col: string, d2: string, rowDigits: string) => {
+              if (col.toUpperCase() !== colLetter) return full;
+              const refRow = parseInt(rowDigits, 10);
+              const mapped = mentalToActualSubtotalRow.get(refRow);
+              if (
+                mapped !== undefined &&
+                mapped < actualRow &&
+                (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
+                isFormulaCell(mapped)
+              ) {
+                return `${prefix}${d1}${colLetter}${d2}${mapped}`;
+              }
+              const passThrough = passThroughSubtotalRow.get(refRow);
+              if (passThrough !== undefined && passThrough < actualRow) {
+                return `${prefix}${d1}${colLetter}${d2}${passThrough}`;
+              }
+              return full;
+            },
+          );
+          rowArr[c] = { formula: repaired };
+        }
+      }
+    }
+  }
+
+  return rows;
 }
 
 export { MAX_REPAIR_ATTEMPTS_PER_CALL };

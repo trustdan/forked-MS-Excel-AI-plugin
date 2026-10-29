@@ -9,12 +9,17 @@ export const MAX_SSE_STREAM_BYTES = 8 * 1024 * 1024; // 8 MiB
 /**
  * Maximum length of a single buffered SSE line before rejecting as malformed.
  */
-export const MAX_SSE_LINE_CHARS = 1024 * 1024; // 1 MiB
+export const MAX_SSE_LINE_CHARS = 4 * 1024 * 1024; // 4 MiB
 
 /**
  * Maximum accumulated characters for content, reasoning, or tool argument buffers.
  */
-export const MAX_ACCUMULATED_TEXT_CHARS = 2 * 1024 * 1024; // 2 MiB
+export const MAX_ACCUMULATED_TEXT_CHARS = 4 * 1024 * 1024; // 4 MiB
+
+/**
+ * Maximum time to wait for the next SSE chunk before aborting a stalled stream.
+ */
+export const DEFAULT_SSE_INACTIVITY_TIMEOUT_MS = 180_000; // 3 minutes
 
 export interface SseEvent {
   event?: string;
@@ -32,6 +37,7 @@ export async function readSseStream(
     abortSignal?: AbortSignal;
     maxStreamBytes?: number;
     maxLineChars?: number;
+    inactivityTimeoutMs?: number;
   },
 ): Promise<void> {
   const body = res.body;
@@ -41,6 +47,7 @@ export async function readSseStream(
 
   const maxStreamBytes = options?.maxStreamBytes ?? MAX_SSE_STREAM_BYTES;
   const maxLineChars = options?.maxLineChars ?? MAX_SSE_LINE_CHARS;
+  const inactivityTimeoutMs = options?.inactivityTimeoutMs ?? DEFAULT_SSE_INACTIVITY_TIMEOUT_MS;
   const abortSignal = options?.abortSignal;
 
   if (abortSignal?.aborted) {
@@ -58,6 +65,32 @@ export async function readSseStream(
     void reader.cancel().catch(() => {});
   };
   abortSignal?.addEventListener('abort', onAbort, { once: true });
+
+  const readNextChunk = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+    if (inactivityTimeoutMs <= 0) {
+      return reader.read();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            void reader.cancel().catch(() => {});
+            reject(
+              new ProviderError(
+                `SSE stream timed out after ${Math.round(inactivityTimeoutMs / 1000)}s of inactivity. Check if your local model server is stuck or out of context memory.`,
+                504,
+                false,
+              ),
+            );
+          }, inactivityTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
 
   const flushBlock = (): boolean => {
     if (dataLines.length === 0) {
@@ -80,7 +113,7 @@ export async function readSseStream(
       if (abortSignal?.aborted) {
         throw createAbortError();
       }
-      const { value, done } = await reader.read();
+      const { value, done } = await readNextChunk();
       if (abortSignal?.aborted) {
         throw createAbortError();
       }

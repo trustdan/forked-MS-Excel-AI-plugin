@@ -221,93 +221,113 @@ export class OpenAIProvider implements Provider {
     const toolCallMap = new Map<number, { id: string; name: string; arguments: string }>();
     const splitter = new ThinkStreamSplitter(options.onDelta);
 
-    await readSseStream(
-      res,
-      (ev) => {
-        let chunk: {
-          choices?: {
-            delta?: {
-              content?: string | null;
-              reasoning_content?: string | null;
-              reasoning?: string | null;
-              tool_calls?: {
-                index?: number;
-                id?: string;
-                function?: { name?: string; arguments?: string };
-              }[];
+    try {
+      await readSseStream(
+        res,
+        (ev) => {
+          let chunk: {
+            choices?: {
+              delta?: {
+                content?: string | null;
+                reasoning_content?: string | null;
+                reasoning?: string | null;
+                tool_calls?: {
+                  index?: number;
+                  id?: string;
+                  function?: { name?: string; arguments?: string };
+                }[];
+              };
+              finish_reason?: string | null;
+            }[];
+            usage?: {
+              prompt_tokens?: number;
+              completion_tokens?: number;
+              completion_tokens_details?: { reasoning_tokens?: number };
             };
-            finish_reason?: string | null;
-          }[];
-          usage?: {
-            prompt_tokens?: number;
-            completion_tokens?: number;
-            completion_tokens_details?: { reasoning_tokens?: number };
+            error?: { message?: string };
           };
-          error?: { message?: string };
-        };
-        try {
-          chunk = JSON.parse(ev.data);
-        } catch {
-          return;
-        }
-
-        if (chunk.error?.message) {
-          throw new ProviderError(`${this.id} stream error: ${chunk.error.message}`);
-        }
-
-        if (chunk.usage) {
-          if (chunk.usage.prompt_tokens !== undefined) promptTokens = chunk.usage.prompt_tokens;
-          if (chunk.usage.completion_tokens !== undefined) {
-            completionTokens = chunk.usage.completion_tokens;
+          try {
+            chunk = JSON.parse(ev.data);
+          } catch {
+            return;
           }
-          if (chunk.usage.completion_tokens_details?.reasoning_tokens !== undefined) {
-            reasoningTokens = chunk.usage.completion_tokens_details.reasoning_tokens;
+
+          if (chunk.error?.message) {
+            throw new ProviderError(`${this.id} stream error: ${chunk.error.message}`);
           }
-        }
 
-        const choice = chunk.choices?.[0];
-        if (!choice) return;
-
-        if (choice.finish_reason) {
-          finishReason = choice.finish_reason;
-        }
-
-        const delta = choice.delta;
-        if (!delta) return;
-
-        const reasoningPiece = delta.reasoning_content ?? delta.reasoning;
-        if (reasoningPiece) {
-          explicitReasoning = appendBounded(explicitReasoning, reasoningPiece);
-          splitter.pushReasoning(reasoningPiece);
-        }
-
-        if (delta.content) {
-          rawContent = appendBounded(rawContent, delta.content);
-          splitter.pushContent(delta.content);
-        }
-
-        if (delta.tool_calls) {
-          for (let i = 0; i < delta.tool_calls.length; i++) {
-            const tc = delta.tool_calls[i]!;
-            const idx = tc.index ?? i;
-            let entry = toolCallMap.get(idx);
-            if (!entry) {
-              entry = { id: tc.id ?? `call_${idx}`, name: '', arguments: '' };
-              toolCallMap.set(idx, entry);
-            } else if (tc.id) {
-              entry.id = tc.id;
+          if (chunk.usage) {
+            if (chunk.usage.prompt_tokens !== undefined) promptTokens = chunk.usage.prompt_tokens;
+            if (chunk.usage.completion_tokens !== undefined) {
+              completionTokens = chunk.usage.completion_tokens;
             }
-            if (tc.function?.name) {
-              entry.name += tc.function.name;
-            }
-            if (tc.function?.arguments) {
-              entry.arguments = appendBounded(entry.arguments, tc.function.arguments);
+            if (chunk.usage.completion_tokens_details?.reasoning_tokens !== undefined) {
+              reasoningTokens = chunk.usage.completion_tokens_details.reasoning_tokens;
             }
           }
+
+          const choice = chunk.choices?.[0];
+          if (!choice) return;
+
+          if (choice.finish_reason) {
+            finishReason = choice.finish_reason;
+          }
+
+          const delta = choice.delta;
+          if (!delta) return;
+
+          const reasoningPiece = delta.reasoning_content ?? delta.reasoning;
+          if (reasoningPiece) {
+            explicitReasoning = appendBounded(explicitReasoning, reasoningPiece);
+            splitter.pushReasoning(reasoningPiece);
+          }
+
+          if (delta.content) {
+            rawContent = appendBounded(rawContent, delta.content);
+            splitter.pushContent(delta.content);
+          }
+
+          if (delta.tool_calls) {
+            for (let i = 0; i < delta.tool_calls.length; i++) {
+              const tc = delta.tool_calls[i]!;
+              const idx = tc.index ?? i;
+              let entry = toolCallMap.get(idx);
+              if (!entry) {
+                entry = { id: tc.id ?? `call_${idx}`, name: '', arguments: '' };
+                toolCallMap.set(idx, entry);
+              } else if (tc.id) {
+                entry.id = tc.id;
+              }
+              if (tc.function?.name) {
+                entry.name += tc.function.name;
+                options.onDelta?.({ toolCallName: entry.name });
+              }
+              if (tc.function?.arguments) {
+                entry.arguments = appendBounded(entry.arguments, tc.function.arguments);
+              }
+            }
+          }
+        },
+        { abortSignal: options.abortSignal },
+      );
+    } catch (err) {
+      // If a local server emits a runaway SSE line or buffer overflow (e.g. GBNF whitespace loop
+      // inside a buffered tool_call), salvage the reasoning/content streamed so far and mark
+      // finishReason as 'length' so the agent loop can rescue or retry instead of crashing.
+      if (err instanceof ProviderError && err.status === 413) {
+        finishReason = 'length';
+        reasoningTokens = Math.max(reasoningTokens, 1);
+        for (const [idx, entry] of toolCallMap.entries()) {
+          try {
+            JSON.parse(entry.arguments);
+          } catch {
+            toolCallMap.delete(idx);
+          }
         }
-      },
-      { abortSignal: options.abortSignal },
-    );
+      } else {
+        throw err;
+      }
+    }
 
     splitter.flush();
 

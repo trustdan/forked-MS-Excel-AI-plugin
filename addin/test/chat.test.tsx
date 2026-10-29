@@ -322,5 +322,34 @@ describe('Chat Components', () => {
         text: 'Q1 total is $1,200.',
       });
     });
+
+    it('does not duplicate the assistant bubble when finalized thinking and text events arrive after both thinking_delta and text_delta', () => {
+      let items: ChatItem[] = [{ kind: 'user', text: 'Draft balance sheet' }];
+
+      items = applyAgentEventToItems(items, { kind: 'thinking_delta', text: 'Mapping rows…' });
+      items = applyAgentEventToItems(items, { kind: 'text_delta', text: 'Done — staged!' });
+      // provider.chat() finishes and loop.ts emits finalized thinking followed by finalized text
+      items = applyAgentEventToItems(items, {
+        kind: 'thinking',
+        text: 'Mapping rows…',
+        durationMs: 1500,
+      });
+      items = applyAgentEventToItems(items, {
+        kind: 'text',
+        text: 'Done — staged!',
+      });
+
+      expect(items).toHaveLength(3);
+      expect(items[1]).toEqual({
+        kind: 'activity',
+        active: false,
+        totalDurationMs: 1500,
+        steps: [{ kind: 'thinking', text: 'Mapping rows…', durationMs: 1500 }],
+      });
+      expect(items[2]).toEqual({
+        kind: 'assistant',
+        text: 'Done — staged!',
+      });
+    });
   });
 });
