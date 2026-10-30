@@ -25,6 +25,7 @@ describe('ChangeSetCard', () => {
       <ChangeSetCard
         id="cs-1"
         preview={mockPreview}
+        undoFidelity="full"
         status="staged"
         onApprove={onApprove}
         onReject={onReject}
@@ -54,6 +55,7 @@ describe('ChangeSetCard', () => {
       <ChangeSetCard
         id="cs-2"
         preview={mockPreview}
+        undoFidelity="full"
         status="applied"
         onApprove={() => {}}
         onReject={() => {}}
@@ -77,6 +79,7 @@ describe('ChangeSetCard', () => {
           { op: { kind: 'clear_range', range: "'2025 Payroll'!A1:B2", reason: 'reset' } },
           { op: { kind: 'add_sheet', name: 'Summary', reason: 'new output' } },
         ]}
+        undoFidelity="full"
         status="staged"
         onApprove={() => {}}
         onReject={() => {}}
@@ -84,6 +87,60 @@ describe('ChangeSetCard', () => {
       />,
     );
     expect(screen.getByText('Sheets: 2025 Payroll, Summary')).toBeDefined();
+  });
+
+  const noop = () => {};
+
+  it('offers no Undo for a set that cannot be undone, and says why before approval', () => {
+    const preview = [
+      { op: { kind: 'insert_rows' as const, sheet: 'Sheet1', at: 0, count: 1, reason: 'room' } },
+      { op: { kind: 'rename_sheet' as const, name: 'Sheet1', newName: 'Data', reason: 'clarity' } },
+    ];
+    const props = { id: 'cs-4', preview, undoFidelity: 'none' as const, onApprove: noop, onReject: noop, onUndo: noop };
+
+    const { rerender } = render(<ChangeSetCard {...props} status="staged" />);
+    expect(screen.getByText("Can't be undone: it inserts rows, renames a sheet.")).toBeDefined();
+
+    rerender(<ChangeSetCard {...props} status="applied" />);
+    expect(screen.queryByRole('button', { name: 'Undo' })).toBeNull();
+  });
+
+  it('says formatting stays when undo restores values only', () => {
+    render(
+      <ChangeSetCard
+        id="cs-5"
+        preview={mockPreview}
+        undoFidelity="values_only"
+        status="applied"
+        onApprove={noop}
+        onReject={noop}
+        onUndo={noop}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeDefined();
+    expect(screen.getByText('Undo restores values and formulas; formatting stays as applied.')).toBeDefined();
+  });
+
+  it.each([
+    ['rolled_back', 'Not applied (rolled back)'],
+    ['failed_partial', 'Partly applied: check the workbook'],
+    ['unknown', 'No longer available'],
+  ] as const)('shows %s with no actions', (status, title) => {
+    render(
+      <ChangeSetCard
+        id="cs-6"
+        preview={mockPreview}
+        undoFidelity="full"
+        status={status}
+        onApprove={noop}
+        onReject={noop}
+        onUndo={noop}
+      />,
+    );
+    expect(screen.getByText(title)).toBeDefined();
+    for (const name of ['Apply', 'Dismiss', 'Undo']) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
   });
 });
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { WorkbookEmulator } from '../src/workbook/emulator.js';
 import { ChangeSetManager } from '../src/changeset/manager.js';
 import type { WorkbookExecutor } from '../src/workbook/executor.js';
+import type { ChangeOp } from '@excelai/shared';
 
 describe('change-set lifecycle', () => {
   it('stages, previews, applies and undoes a write', async () => {
@@ -66,11 +67,34 @@ describe('change-set lifecycle', () => {
     expect(mgr.get(cs.id)?.status).toBe('rolled_back'); // touched the workbook, so never staged again
   });
 
-  it('marks change-sets with structural ops as partial undo fidelity', async () => {
+  it('grades undo fidelity by what snapshots can restore', async () => {
     const wb = new WorkbookEmulator(['Sheet1']);
     const mgr = new ChangeSetManager(wb, 'wb-1');
-    const cs = await mgr.stage([{ kind: 'add_sheet', name: 'Report', reason: 'new output sheet' }]);
-    expect(cs.undoFidelity).toBe('partial');
+    const fidelity = async (ops: ChangeOp[]) => (await mgr.stage(ops)).undoFidelity;
+    const bold = { bold: true };
+
+    expect(await fidelity([{ kind: 'add_sheet', name: 'Report', reason: 'x' }])).toBe('full');
+    // Formatting a sheet the set adds goes away with the sheet.
+    expect(
+      await fidelity([
+        { kind: 'add_sheet', name: 'Report', reason: 'x' },
+        { kind: 'format_range', range: 'Report!A1', format: bold, reason: 'x' },
+      ]),
+    ).toBe('full');
+    expect(
+      await fidelity([{ kind: 'format_range', range: 'Sheet1!A1', format: bold, reason: 'x' }]),
+    ).toBe('values_only');
+    expect(
+      await fidelity([
+        { kind: 'sort_range', range: 'Sheet1!A1:A3', keyOffset: 0, ascending: true, hasHeader: false, reason: 'x' },
+      ]),
+    ).toBe('values_only');
+    expect(await fidelity([{ kind: 'insert_rows', sheet: 'Sheet1', at: 0, count: 1, reason: 'x' }])).toBe(
+      'none',
+    );
+    expect(await fidelity([{ kind: 'rename_sheet', name: 'Sheet1', newName: 'Data', reason: 'x' }])).toBe(
+      'none',
+    );
   });
 
   it('rejects mismatched cell matrix dimensions', async () => {
@@ -385,15 +409,29 @@ describe('partial-apply recovery (C1)', () => {
     const wb = new WorkbookEmulator(['Sheet1']);
     const mgr = new ChangeSetManager(failsAfterFirstOp(wb), 'wb-1');
     const cs = await mgr.stage([
+      { kind: 'insert_rows', sheet: 'Sheet1', at: 0, count: 1, reason: 'x' },
+      writeOp('Sheet1!A1', [[{ value: 1 }]]),
+    ]);
+
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/host failed mid-apply/);
+
+    expect(mgr.get(cs.id)?.status).toBe('failed_partial');
+    expect(mgr.get(cs.id)?.unrecovered).toEqual(['insert_rows Sheet1 at 0 ×1 (not reverted)']);
+  });
+
+  it('removes a sheet the half-applied set added, and ends rolled_back', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(failsAfterFirstOp(wb), 'wb-1');
+    const cs = await mgr.stage([
       { kind: 'add_sheet', name: 'Report', reason: 'x' },
       writeOp('Sheet1!A1', [[{ value: 1 }]]),
     ]);
 
     await expect(mgr.apply(cs.id)).rejects.toThrow(/host failed mid-apply/);
 
+    expect(wb.sheetExists('Report')).toBe(false);
     expect(wb.getValue('Sheet1!A1')).toBeNull();
-    expect(mgr.get(cs.id)?.status).toBe('failed_partial');
-    expect(mgr.get(cs.id)?.unrecovered).toEqual(['add_sheet "Report" (not reverted)']);
+    expect(mgr.get(cs.id)?.status).toBe('rolled_back');
   });
 
   it('keeps a set staged when it fails before any op reaches the workbook', async () => {
@@ -403,5 +441,143 @@ describe('partial-apply recovery (C1)', () => {
 
     await expect(mgr.apply(big.id)).rejects.toThrow(/more than 100000 cells/);
     expect(mgr.get(big.id)?.status).toBe('staged');
+  });
+});
+
+describe('honest, conflict-aware undo (F8)', () => {
+  const write = (range: string, value: number | string): ChangeOp => ({
+    kind: 'write_range',
+    range,
+    cells: [[{ value }]],
+    reason: 'x',
+  });
+
+  async function applied(mgr: ChangeSetManager, ops: ChangeOp[]): Promise<string> {
+    const cs = await mgr.stage(ops);
+    expect((await mgr.apply(cs.id)).ok).toBe(true);
+    return cs.id;
+  }
+
+  it('audit probe: undoing add_sheet deletes the sheet', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const id = await applied(mgr, [
+      { kind: 'add_sheet', name: 'Report', reason: 'x' },
+      write('Report!A1', 'Total'),
+    ]);
+    expect(wb.sheetExists('Report')).toBe(true);
+
+    await mgr.undo(id);
+
+    expect(wb.sheetExists('Report')).toBe(false);
+    expect(mgr.get(id)?.status).toBe('undone');
+  });
+
+  it('refuses to delete an added sheet that now holds content the set did not write', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const id = await applied(mgr, [
+      { kind: 'add_sheet', name: 'Report', reason: 'x' },
+      write('Report!A1', 'Total'),
+    ]);
+    wb.setCell('Report!C5', 'user notes');
+
+    await expect(mgr.undo(id)).rejects.toThrow(/Undo refused: Report!C5 changed/);
+
+    expect(wb.getValue('Report!C5')).toBe('user notes');
+    expect(mgr.get(id)?.status).toBe('applied');
+  });
+
+  it('audit probe: undoing an older set refuses to overwrite a later change to the same cell', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 0);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const first = await applied(mgr, [write('Sheet1!A1', 1)]);
+    const second = await applied(mgr, [write('Sheet1!A1', 2)]);
+
+    await expect(mgr.undo(first)).rejects.toThrow(/Undo refused: Sheet1!A1 changed.*Nothing was changed/);
+    expect(wb.getValue('Sheet1!A1')).toBe(2);
+    expect(mgr.get(first)?.status).toBe('applied');
+
+    // Undoing newest-first is clean, after which the older set undoes too.
+    await mgr.undo(second);
+    await mgr.undo(first);
+    expect(wb.getValue('Sheet1!A1')).toBe(0);
+  });
+
+  it('refuses to overwrite a manual edit, and allows undoing an older set whose cells are untouched', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const edited = await applied(mgr, [write('Sheet1!A1', 1)]);
+    const untouched = await applied(mgr, [write('Sheet1!B1', 1)]);
+    const newest = await applied(mgr, [write('Sheet1!C1', 1)]);
+    wb.setCell('Sheet1!A1', 'typed by user');
+
+    await expect(mgr.undo(edited)).rejects.toThrow(/Sheet1!A1 changed/);
+    await mgr.undo(untouched);
+
+    expect(wb.getValue('Sheet1!A1')).toBe('typed by user');
+    expect(wb.getValue('Sheet1!B1')).toBeNull();
+    expect(mgr.get(newest)?.status).toBe('applied');
+  });
+
+  it('audit probe: a sort is advertised as values-only, and its undo restores the values', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 2);
+    wb.setCell('Sheet1!A2', 1);
+    await wb.applyOps([
+      { kind: 'format_range', range: 'Sheet1!A1', format: { fillColor: '#FF0000' }, reason: 'red' },
+      { kind: 'format_range', range: 'Sheet1!A2', format: { fillColor: '#0000FF' }, reason: 'blue' },
+    ]);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([
+      { kind: 'sort_range', range: 'Sheet1!A1:A2', keyOffset: 0, ascending: true, hasHeader: false, reason: 'x' },
+    ]);
+    expect(cs.undoFidelity).toBe('values_only');
+    await mgr.apply(cs.id);
+
+    await mgr.undo(cs.id);
+
+    expect(wb.getValue('Sheet1!A1')).toBe(2);
+    expect(wb.getValue('Sheet1!A2')).toBe(1);
+    expect(mgr.get(cs.id)?.status).toBe('undone');
+  });
+
+  it('refuses to undo a set whose structural ops snapshots cannot express', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 'keep');
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const id = await applied(mgr, [
+      { kind: 'insert_rows', sheet: 'Sheet1', at: 0, count: 1, reason: 'x' },
+      write('Sheet1!A1', 'header'),
+    ]);
+
+    await expect(mgr.undo(id)).rejects.toThrow(/cannot be undone: it contains insert_rows/);
+
+    expect(wb.getValue('Sheet1!A1')).toBe('header');
+    expect(wb.getValue('Sheet1!A2')).toBe('keep');
+    expect(mgr.get(id)?.status).toBe('applied');
+  });
+
+  it('ends failed_partial and lists the cells an undo could not restore', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    let refuse = false;
+    const executor: WorkbookExecutor = {
+      getWorkbookMap: () => wb.getWorkbookMap(),
+      readRange: (range) => wb.readRange(range),
+      find: (q, s) => wb.find(q, s),
+      applyOps: async (ops) => {
+        if (refuse) throw new Error('host refused restore');
+        return wb.applyOps(ops);
+      },
+    };
+    const mgr = new ChangeSetManager(executor, 'wb-1');
+    const id = await applied(mgr, [write('Sheet1!A1', 1)]);
+    refuse = true;
+
+    await expect(mgr.undo(id)).rejects.toThrow(/Undo did not complete/);
+
+    expect(mgr.get(id)?.status).toBe('failed_partial');
+    expect(mgr.get(id)?.unrecovered).toEqual(['Sheet1!A1']);
   });
 });

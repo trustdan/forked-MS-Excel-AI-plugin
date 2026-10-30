@@ -135,7 +135,7 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 | F5 | P1 | E0 → E4 | 0 / 3 | open |
 | F6 | P1 | E0 → E5 | 0 / 3 | open |
 | F7 | P2 | E5 | 3 | open |
-| F8 | P2 | E2c | 2 | open |
+| F8 | P2 | E2c | 2 | done |
 | F9 | P2 | E6 | 3 | open |
 | F10 | P2 | E6 | 3 | open |
 | F11 | P2 | E6 | 3 | open |

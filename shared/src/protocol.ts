@@ -1,4 +1,4 @@
-import type { ChangeOp, ChangePreviewItem } from './changeset.js';
+import type { ChangeOp, ChangePreviewItem, ChangeSetStatus, UndoFidelity } from './changeset.js';
 
 /**
  * WebSocket protocol between the add-in (browser) and the sidecar.
@@ -73,9 +73,14 @@ export type AgentEvent = Envelope<
   | { kind: 'thinking'; text: string; durationMs?: number }
   | { kind: 'text'; text: string }
   | { kind: 'tool_use'; tool: string; summary: string }
-  | { kind: 'changeset_staged'; changeSetId: string; preview: ChangePreviewItem[] }
-  | { kind: 'changeset_applied'; changeSetId: string }
-  | { kind: 'changeset_undone'; changeSetId: string }
+  | {
+      kind: 'changeset_staged';
+      changeSetId: string;
+      preview: ChangePreviewItem[];
+      undoFidelity: UndoFidelity;
+    }
+  /** `unknown`: the sidecar no longer has this set (e.g. it restarted). */
+  | { kind: 'changeset_status'; changeSetId: string; status: ChangeSetStatus | 'unknown' }
   | { kind: 'error'; message: string }
   | { kind: 'stopped'; reason?: string }
   | { kind: 'done' }

@@ -437,10 +437,21 @@ header .ghost ~ .ghost {
 }
 
 .cs.rejected,
-.cs.undone {
+.cs.undone,
+.cs.rolled_back,
+.cs.unknown {
   border-color: var(--border);
   background: var(--surface);
   opacity: 0.75;
+}
+
+.cs.failed_partial {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.cs.failed_partial .cs-title {
+  color: var(--danger);
 }
 
 .cs-head {
@@ -468,6 +479,12 @@ header .ghost ~ .ghost {
   margin-top: 2px;
   font-size: 11px;
   color: var(--text-2);
+}
+
+.cs-note {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--warn);
 }
 
 .cs-ops {

@@ -93,17 +93,29 @@ export interface ChangeSet {
   /** Snapshot of affected ranges taken just before apply, for undo. */
   snapshots?: RangeSnapshot[];
   /**
+   * The same ranges re-read right after apply. Undo refuses to run if any
+   * of these cells has changed since, rather than overwrite later work.
+   */
+  appliedCells?: RangeSnapshot[];
+  /** Worksheets this set created, by stable id; undo deletes them. */
+  addedSheets?: SheetTarget[];
+  /**
    * After a failed rollback: cell addresses that could not be confirmed
    * restored, plus structural ops that snapshots cannot revert.
    */
   unrecovered?: string[];
-  /**
-   * Undo fidelity. "full" = all ops are range-level and snapshot-restorable.
-   * "partial" = contains structural ops (e.g. add_sheet) that undo can remove
-   * but whose side effects may not be perfectly reversible.
-   */
-  undoFidelity: 'full' | 'partial';
+  undoFidelity: UndoFidelity;
 }
+
+/**
+ * What undo can restore, decided at staging:
+ *  - `full`: writes, clears and added sheets; undo restores the prior state.
+ *  - `values_only`: also formats or sorts existing cells; undo restores cell
+ *    values and formulas, but formatting stays as applied.
+ *  - `none`: inserts/deletes rows or columns, or renames/deletes a sheet;
+ *    snapshots cannot express those, so undo is refused.
+ */
+export type UndoFidelity = 'full' | 'values_only' | 'none';
 
 export interface SheetTarget {
   id: string;

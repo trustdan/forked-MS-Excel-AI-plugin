@@ -1,18 +1,41 @@
-import type { ChangePreviewItem } from '@excelai/shared';
+import type { ChangeOp, ChangePreviewItem, ChangeSetStatus, UndoFidelity } from '@excelai/shared';
 import { DiffInspector } from '../../DiffInspector.js';
 
 export interface ChangeSetCardProps {
   id: string;
   preview: ChangePreviewItem[];
-  status: 'staged' | 'applied' | 'rejected' | 'undone';
+  undoFidelity: UndoFidelity;
+  status: ChangeSetStatus | 'unknown';
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
   onUndo: (id: string) => void;
 }
 
+const TITLES: Record<Exclude<ChangeSetCardProps['status'], 'staged'>, string> = {
+  applying: 'Applying…',
+  applied: 'Applied',
+  rolled_back: 'Not applied (rolled back)',
+  failed_partial: 'Partly applied: check the workbook',
+  rejected: 'Dismissed',
+  undoing: 'Undoing…',
+  undone: 'Undone',
+  unknown: 'No longer available',
+};
+
+/** Ops that make a set impossible to undo, phrased for the card. */
+const NOT_UNDOABLE: Partial<Record<ChangeOp['kind'], string>> = {
+  insert_rows: 'inserts rows',
+  delete_rows: 'deletes rows',
+  insert_cols: 'inserts columns',
+  delete_cols: 'deletes columns',
+  rename_sheet: 'renames a sheet',
+  delete_sheet: 'deletes a sheet',
+};
+
 export function ChangeSetCard({
   id,
   preview,
+  undoFidelity,
   status,
   onApprove,
   onReject,
@@ -20,17 +43,12 @@ export function ChangeSetCard({
 }: ChangeSetCardProps): JSX.Element {
   const n = preview.length;
   const sheets = targetSheets(preview);
+  const note = status === 'staged' || status === 'applied' ? undoNote(undoFidelity, preview) : null;
   return (
     <div className={`cs ${status}`}>
       <div className="cs-head">
         <span className="cs-title">
-          {status === 'staged'
-            ? `${n} proposed change${n === 1 ? '' : 's'}`
-            : status === 'applied'
-              ? 'Applied'
-              : status === 'undone'
-                ? 'Undone'
-                : 'Dismissed'}
+          {status === 'staged' ? `${n} proposed change${n === 1 ? '' : 's'}` : TITLES[status]}
         </span>
         <span className="cs-actions">
           {status === 'staged' && (
@@ -43,7 +61,7 @@ export function ChangeSetCard({
               </button>
             </>
           )}
-          {status === 'applied' && (
+          {status === 'applied' && undoFidelity !== 'none' && (
             <button className="sm subtle" onClick={() => onUndo(id)}>
               Undo
             </button>
@@ -55,6 +73,7 @@ export function ChangeSetCard({
           {sheets.length === 1 ? 'Sheet' : 'Sheets'}: {sheets.join(', ')}
         </div>
       )}
+      {note && <div className="cs-note">{note}</div>}
       <div className="cs-ops">
         {preview.map((p, i) => (
           <DiffInspector key={i} item={p} />
@@ -62,6 +81,14 @@ export function ChangeSetCard({
       </div>
     </div>
   );
+}
+
+/** What undo will and won't restore, shown before approval and after apply. */
+function undoNote(fidelity: UndoFidelity, preview: ChangePreviewItem[]): string | null {
+  if (fidelity === 'values_only') return 'Undo restores values and formulas; formatting stays as applied.';
+  if (fidelity === 'full') return null;
+  const reasons = [...new Set(preview.map(({ op }) => NOT_UNDOABLE[op.kind]).filter(Boolean))];
+  return `Can't be undone: it ${reasons.join(', ')}.`;
 }
 
 /** Distinct sheets the ops touch, as resolved at staging (exact names). */

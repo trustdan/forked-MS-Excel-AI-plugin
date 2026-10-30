@@ -176,7 +176,7 @@ const finished = new Promise((resolve, reject) => {
           }
           log('change-set staged with preview; cell untouched before approval ✓');
         }
-        if (ev.kind === 'changeset_applied') {
+        if (ev.kind === 'changeset_status' && ev.status === 'applied') {
           applied = true;
           clearTimeout(timeout);
           resolve();

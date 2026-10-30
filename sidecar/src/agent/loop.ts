@@ -11,6 +11,7 @@ import {
   type ChangeOp,
   type ToolName,
   type ChangePreviewItem,
+  type UndoFidelity,
   type WorkbookMap,
 } from '@excelai/shared';
 import type { ChatMessage, Provider, ToolSpec } from '../providers/types.js';
@@ -34,7 +35,12 @@ export type AgentEvent =
   | { kind: 'thinking'; text: string; durationMs?: number }
   | { kind: 'text'; text: string }
   | { kind: 'tool_use'; tool: string; summary: string }
-  | { kind: 'changeset_staged'; changeSetId: string; preview: ChangePreviewItem[] }
+  | {
+      kind: 'changeset_staged';
+      changeSetId: string;
+      preview: ChangePreviewItem[];
+      undoFidelity: UndoFidelity;
+    }
   | { kind: 'error'; message: string }
   | { kind: 'stopped'; reason?: string };
 
@@ -462,7 +468,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
     try {
       const cs = await changeSets.stage(pendingOps);
       const preview = await changeSets.preview(cs.id);
-      emit({ kind: 'changeset_staged', changeSetId: cs.id, preview });
+      emit({ kind: 'changeset_staged', changeSetId: cs.id, preview, undoFidelity: cs.undoFidelity });
       result.stagedChangeSetId = cs.id;
     } catch (e) {
       emit({
