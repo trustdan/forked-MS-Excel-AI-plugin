@@ -6,11 +6,17 @@
   1. Copies the system node.exe to ./bin/node-offline.exe.
   2. Ensures bin/ is added to .gitignore.
   3. Configures a Windows Defender Firewall Outbound Rule to block all remote IP addresses
-     (0.0.0.0-126.255.255.255 and 128.0.0.0-255.255.255.255) for node-offline.exe.
-  4. Keeps loopback (127.0.0.0/8) open so the sidecar can communicate with LM Studio and Excel.
+     for node-offline.exe: IPv4 0.0.0.0-126.255.255.255 and 128.0.0.0-255.255.255.255, and
+     every IPv6 address except ::1.
+  4. Keeps loopback (127.0.0.0/8 and ::1) open so the sidecar can communicate with LM Studio and Excel.
 
 .NOTES
   Must be executed in an elevated PowerShell session (Run as Administrator).
+
+  The rule matches one program: node-offline.exe. A stdio MCP server the sidecar starts is a
+  separate process. If its command is node-offline.exe (the sidecar's own executable), the rule
+  covers it. Any other binary (npx, node.exe, python.exe, uvx, a server's own .exe) is NOT
+  restricted and needs its own outbound block rule.
 #>
 
 [CmdletBinding()]
@@ -65,10 +71,14 @@ if ($existingRule) {
     Remove-NetFirewallRule -DisplayName $RuleName
 }
 
-# Block all non-loopback addresses: 0.0.0.0-126.255.255.255 and 128.0.0.0-255.255.255.255
+# Block every non-loopback address. IPv4: all but 127.0.0.0/8. IPv6: all above ::1
+# (below it are only ::1 itself and the unspecified ::, which cannot be a destination).
+# The IPv6 range also covers IPv4-mapped addresses (::ffff:0:0/96), including the
+# mapped loopback; the sidecar's network guard refuses those anyway.
 $BlockedRanges = @(
     "0.0.0.0-126.255.255.255",
-    "128.0.0.0-255.255.255.255"
+    "128.0.0.0-255.255.255.255",
+    "::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
 )
 
 Write-Host "Configuring outbound Windows Defender Firewall rule for node-offline.exe..." -ForegroundColor Cyan
@@ -82,8 +92,11 @@ New-NetFirewallRule `
     -RemoteAddress $BlockedRanges `
     -Enabled True | Out-Null
 
-Write-Host "`n✓ Firewall rule '$RuleName' successfully established." -ForegroundColor Green
-Write-Host "✓ Outbound traffic from '$NodeOfflineExe' is blocked for all non-loopback IPs." -ForegroundColor Green
-Write-Host "✓ Localhost (127.0.0.0/8) remains accessible for LM Studio and Excel taskpane." -ForegroundColor Green
+Write-Host "`n[OK] Firewall rule '$RuleName' successfully established." -ForegroundColor Green
+Write-Host "[OK] Outbound traffic from '$NodeOfflineExe' is blocked for all non-loopback IPs." -ForegroundColor Green
+Write-Host "[OK] Localhost (127.0.0.0/8 and ::1) remains accessible for LM Studio and Excel taskpane." -ForegroundColor Green
+Write-Host "`nNote: stdio MCP servers run as their own processes. Unless a server's command is" -ForegroundColor Yellow
+Write-Host "  $NodeOfflineExe" -ForegroundColor Yellow
+Write-Host "this rule does not restrict it; give that binary its own outbound block rule." -ForegroundColor Yellow
 Write-Host "`nYou can now launch the offline sidecar using:" -ForegroundColor Yellow
 Write-Host "  pnpm start:offline`n" -ForegroundColor Yellow

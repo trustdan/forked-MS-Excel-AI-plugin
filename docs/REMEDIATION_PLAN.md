@@ -147,7 +147,7 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 | C5 Settings corruption | P2 | E7 | 4 | done |
 | C6 Cloud docs mismatch | P2 | E9 | 4 | open |
 | C7 CI `--ignore-scripts` / README count | P3 | E0 / E9 | 0 / 4 | open |
-| L1 Embedded provider cleanup | — | E8 | 4 | investigate |
-| L2 MCP stdio deadlines | — | E8 | 4 | investigate |
+| L1 Embedded provider cleanup | — | E8 | 4 | done |
+| L2 MCP stdio deadlines | — | E8 | 4 | done |
 | L3 Retention budgets | — | E7 | 4 | done |
-| L4 Firewall IPv6 | — | E8 | 4 | investigate |
+| L4 Firewall IPv6 | — | E8 | 4 | done (rule creation on an elevated test machine pending) |

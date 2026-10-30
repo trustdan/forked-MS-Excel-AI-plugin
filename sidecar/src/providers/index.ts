@@ -6,7 +6,7 @@ import { ProviderError, type Provider, type ProviderConfig } from './types.js';
 export * from './types.js';
 export * from './sse.js';
 export { AnthropicProvider, anthropicUrl } from './anthropic.js';
-export { EmbeddedLlamaProvider, listLocalGgufModels, resolveModelPath, getModelsDir, MockLlamaBackend, extractThinking, extractToolCalls } from './embedded.js';
+export { EmbeddedLlamaProvider, NodeLlamaCppBackend, disposeEmbeddedRuntime, listLocalGgufModels, resolveModelPath, getModelsDir, MockLlamaBackend, extractThinking, extractToolCalls } from './embedded.js';
 export { OpenAIProvider } from './openai.js';
 export { ScriptedProvider, type ScriptedTurn } from './scripted.js';
 

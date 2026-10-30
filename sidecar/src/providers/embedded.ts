@@ -106,27 +106,49 @@ export interface LlamaEngineBackend {
   dispose?(): Promise<void>;
 }
 
+type GenerateOptions = Parameters<LlamaEngineBackend['generate']>[1];
+
+interface CachedModel {
+  model: Promise<any>;
+  /** Generations currently holding this model. */
+  users: number;
+  /** Evicted from the cache; disposed once the last user releases it. */
+  evicted: boolean;
+}
+
+/** Loaded GGUF models kept warm. Each one can hold gigabytes of RAM/VRAM. */
+export const DEFAULT_MAX_CACHED_MODELS = 1;
+
 /**
  * Dynamic node-llama-cpp backend. Loads bindings on demand to ensure
  * installation remains zero-script and builds never fail when native toolchains
  * are absent.
+ *
+ * Every generation's context and chat session are disposed when it completes,
+ * is cancelled or fails. Loaded models sit in an LRU bounded by `maxModels`; an
+ * evicted model that a generation is still using is disposed when that
+ * generation releases it, never underneath it.
  */
 export class NodeLlamaCppBackend implements LlamaEngineBackend {
-  private static cachedLlama: unknown = null;
-  private static cachedModels = new Map<string, unknown>();
+  private readonly loadModule: () => Promise<any>;
+  private readonly maxModels: number;
+  private llama: Promise<any> | null = null;
+  private readonly models = new Map<string, CachedModel>();
+
+  constructor(options?: { loadModule?: () => Promise<any>; maxModels?: number }) {
+    // @ts-ignore optional native dependency, absent from the lockfile
+    this.loadModule = options?.loadModule ?? (() => import('node-llama-cpp'));
+    this.maxModels = Math.max(1, options?.maxModels ?? DEFAULT_MAX_CACHED_MODELS);
+  }
+
+  /** Paths of the models currently cached, least recently used first. */
+  cachedModelPaths(): string[] {
+    return [...this.models.keys()];
+  }
 
   async generate(
     prompt: string,
-    options: {
-      modelPath: string;
-      contextSize?: number;
-      threads?: number;
-      gpuLayers?: number;
-      temperature?: number;
-      maxTokens?: number;
-      abortSignal?: AbortSignal;
-      onToken?: (chunk: string) => void;
-    },
+    options: GenerateOptions,
   ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }> {
     if (options.abortSignal?.aborted) {
       throw new Error('AbortError: Generation canceled by user');
@@ -134,9 +156,7 @@ export class NodeLlamaCppBackend implements LlamaEngineBackend {
 
     let llamaModule: any;
     try {
-      // Dynamic import to isolate optional native dependency
-      // @ts-ignore
-      llamaModule = await import('node-llama-cpp');
+      llamaModule = await this.loadModule();
     } catch {
       throw new ProviderError(
         'node-llama-cpp native bindings are not installed or compiled in this environment. ' +
@@ -145,34 +165,23 @@ export class NodeLlamaCppBackend implements LlamaEngineBackend {
       );
     }
 
+    let entry: CachedModel | undefined;
+    let context: any;
+    let session: any;
     try {
-      const getLlama = llamaModule.getLlama;
-      if (!NodeLlamaCppBackend.cachedLlama) {
-        NodeLlamaCppBackend.cachedLlama = await getLlama({
-          gpu: options.gpuLayers && options.gpuLayers > 0 ? 'auto' : false,
-        });
-      }
-      const llama = NodeLlamaCppBackend.cachedLlama as any;
+      entry = this.acquireModel(llamaModule, options);
+      const model = await entry.model;
 
-      let model = NodeLlamaCppBackend.cachedModels.get(options.modelPath) as any;
-      if (!model) {
-        model = await llama.loadModel({
-          modelPath: options.modelPath,
-          gpuLayers: options.gpuLayers,
-        });
-        NodeLlamaCppBackend.cachedModels.set(options.modelPath, model);
-      }
-
-      const context = await model.createContext({
+      context = await model.createContext({
         contextSize: options.contextSize ?? 4096,
         threads: options.threads,
       });
 
-      const session = new llamaModule.LlamaChatSession({
+      session = new llamaModule.LlamaChatSession({
         contextSequence: context.getSequence(),
       });
 
-      const response = await session.prompt(prompt, {
+      const response: string = await session.prompt(prompt, {
         temperature: options.temperature ?? 0.2,
         maxTokens: options.maxTokens ?? 2048,
         signal: options.abortSignal,
@@ -193,13 +202,100 @@ export class NodeLlamaCppBackend implements LlamaEngineBackend {
         throw new Error('AbortError: Generation canceled by user');
       }
       throw new ProviderError(`Embedded GGUF execution error: ${e instanceof Error ? e.message : String(e)}`, 500);
+    } finally {
+      await disposeQuietly(session);
+      await disposeQuietly(context);
+      if (entry) this.releaseModel(entry);
     }
   }
 
-  async dispose(): Promise<void> {
-    NodeLlamaCppBackend.cachedModels.clear();
-    NodeLlamaCppBackend.cachedLlama = null;
+  private acquireModel(llamaModule: any, options: GenerateOptions): CachedModel {
+    const key = options.modelPath;
+    let entry = this.models.get(key);
+    if (entry) {
+      // Re-insert to mark as most recently used.
+      this.models.delete(key);
+      this.models.set(key, entry);
+      entry.users++;
+      return entry;
+    }
+
+    if (!this.llama) {
+      this.llama = Promise.resolve(
+        llamaModule.getLlama({ gpu: options.gpuLayers && options.gpuLayers > 0 ? 'auto' : false }),
+      );
+      // A failed native init must not poison every later attempt.
+      this.llama.catch(() => {
+        this.llama = null;
+      });
+    }
+    const created: CachedModel = {
+      model: this.llama.then((llama) =>
+        llama.loadModel({ modelPath: options.modelPath, gpuLayers: options.gpuLayers }),
+      ),
+      users: 1,
+      evicted: false,
+    };
+    created.model.catch(() => {
+      if (this.models.get(key) === created) this.models.delete(key);
+    });
+    this.models.set(key, created);
+
+    for (const [oldKey, old] of this.models) {
+      if (this.models.size <= this.maxModels) break;
+      if (old === created) continue;
+      this.models.delete(oldKey);
+      old.evicted = true;
+      if (old.users === 0) void disposeModel(old);
+    }
+    return created;
   }
+
+  private releaseModel(entry: CachedModel): void {
+    entry.users--;
+    if (entry.evicted && entry.users === 0) void disposeModel(entry);
+  }
+
+  /**
+   * Dispose every cached model and the native runtime now. Shutdown only: a
+   * generation still in flight fails rather than keeping native memory alive.
+   */
+  async dispose(): Promise<void> {
+    const entries = [...this.models.values()];
+    this.models.clear();
+    for (const entry of entries) entry.evicted = true;
+    await Promise.all(entries.map(disposeModel));
+    const llama = this.llama;
+    this.llama = null;
+    if (llama) await disposeQuietly(await llama.catch(() => null));
+  }
+}
+
+async function disposeModel(entry: CachedModel): Promise<void> {
+  await disposeQuietly(await entry.model.catch(() => null));
+}
+
+async function disposeQuietly(resource: any): Promise<void> {
+  try {
+    await resource?.dispose?.();
+  } catch {
+    // Already disposed, or the native side is gone; nothing left to free.
+  }
+}
+
+let sharedBackend: NodeLlamaCppBackend | null = null;
+
+/** The process-wide backend, so loaded models survive provider re-creation. */
+export function sharedNodeLlamaCppBackend(): NodeLlamaCppBackend {
+  sharedBackend ??= new NodeLlamaCppBackend();
+  return sharedBackend;
+}
+
+/** Free the shared backend's native resources (called on sidecar shutdown). */
+export async function disposeEmbeddedRuntime(): Promise<void> {
+  const backend = sharedBackend;
+  sharedBackend = null;
+  await backend?.dispose();
 }
 
 /**
@@ -548,7 +644,7 @@ export class EmbeddedLlamaProvider implements Provider {
       this.resolvedPath = resolveModelPath(config.model, config.modelPath);
     }
 
-    this.backend = options?.backend ?? new NodeLlamaCppBackend();
+    this.backend = options?.backend ?? sharedNodeLlamaCppBackend();
   }
 
   getResolvedPath(): string {
