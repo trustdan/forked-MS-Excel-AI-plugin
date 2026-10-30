@@ -140,7 +140,7 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 | F10 | P2 | E6 | 3 | open |
 | F11 | P2 | E6 | 3 | open |
 | F12 | P2 | E7 | 4 | open |
-| C1 Partial apply rollback | P1 | E2b | 1 | open |
+| C1 Partial apply rollback | P1 | E2b | 1 | done |
 | C2 Hostname/socket pinning | P1 | E5 | 3 | open |
 | C3 Anthropic `/v1` | P2 | E5 | 3 | open |
 | C4 FS read allocation | P2 | E6 | 3 | open |

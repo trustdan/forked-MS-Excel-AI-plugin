@@ -62,8 +62,8 @@ describe('change-set lifecycle', () => {
     const result = await mgr.apply(cs.id);
     expect(result.ok).toBe(false);
     expect(result.problems[0]).toContain('#DIV/0!');
-    expect(wb.getValue('Sheet1!B1')).toBeNull(); // rolled back
-    expect(mgr.get(cs.id)?.status).toBe('staged'); // back to staged for iteration
+    expect(wb.getValue('Sheet1!B1')).toBeNull();
+    expect(mgr.get(cs.id)?.status).toBe('rolled_back'); // touched the workbook, so never staged again
   });
 
   it('marks change-sets with structural ops as partial undo fidelity', async () => {
@@ -299,6 +299,7 @@ describe('change-set serialization (F3)', () => {
 
     await expect(mgr.apply(cs.id)).rejects.toThrow(/host lost the workbook/);
     expect(mgr.get(cs.id)?.status).toBe('failed_partial');
+    expect(mgr.get(cs.id)?.unrecovered).toEqual(['insert_rows Sheet1 at 0 ×1 (not reverted)']);
     await expect(mgr.apply(cs.id)).rejects.toThrow(/is failed_partial/);
   });
 
@@ -313,5 +314,94 @@ describe('change-set serialization (F3)', () => {
     const [first, second] = await Promise.allSettled([mgr.apply(bad.id), mgr.apply(good.id)]);
     expect(first.status).toBe('rejected');
     expect(second.status).toBe('fulfilled');
+  });
+});
+
+describe('partial-apply recovery (C1)', () => {
+  /** Applies only the first op of the set, then fails; later calls (the rollback) pass through. */
+  function failsAfterFirstOp(wb: WorkbookEmulator, restore: 'ok' | 'fail' = 'ok'): WorkbookExecutor {
+    let calls = 0;
+    return {
+      getWorkbookMap: () => wb.getWorkbookMap(),
+      readRange: (range) => wb.readRange(range),
+      find: (q, s) => wb.find(q, s),
+      applyOps: async (ops) => {
+        calls++;
+        if (calls === 1) {
+          await wb.applyOps(ops.slice(0, 1));
+          throw new Error('host failed mid-apply');
+        }
+        if (restore === 'fail' && ops.some((op) => 'range' in op && op.range === 'Sheet1!B1')) {
+          throw new Error('host refused restore');
+        }
+        return wb.applyOps(ops);
+      },
+    };
+  }
+  const writeOp = (range: string, cells: { value?: number | string; formula?: string }[][]) =>
+    ({ kind: 'write_range', range, cells, reason: 'x' }) as const;
+
+  it('rolls back a half-applied set from the snapshot and ends rolled_back', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 1);
+    wb.setCell('Sheet1!A2', { formula: '=A1*2' });
+    wb.setCell('Sheet1!B1', 'keep');
+    const mgr = new ChangeSetManager(failsAfterFirstOp(wb), 'wb-1');
+    const cs = await mgr.stage([
+      writeOp('Sheet1!A1:A2', [[{ value: 100 }], [{ value: 200 }]]),
+      writeOp('Sheet1!B1', [[{ value: 'changed' }]]),
+    ]);
+
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/host failed mid-apply/);
+
+    expect(wb.getValue('Sheet1!A1')).toBe(1);
+    expect(wb.getValue('Sheet1!A2')).toBe(2);
+    expect((await wb.readRange('Sheet1!A2'))[0]?.[0]?.formula).toBe('=A1*2');
+    expect(wb.getValue('Sheet1!B1')).toBe('keep');
+    expect(mgr.get(cs.id)?.status).toBe('rolled_back');
+    expect(mgr.get(cs.id)?.unrecovered).toBeUndefined();
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/is rolled_back/);
+  });
+
+  it('ends failed_partial and lists the cells it could not restore', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 1);
+    wb.setCell('Sheet1!B1', 'keep');
+    const mgr = new ChangeSetManager(failsAfterFirstOp(wb, 'fail'), 'wb-1');
+    const cs = await mgr.stage([
+      writeOp('Sheet1!B1', [[{ value: 'changed' }]]),
+      writeOp('Sheet1!A1', [[{ value: 100 }]]),
+    ]);
+
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/host failed mid-apply/);
+
+    expect(wb.getValue('Sheet1!A1')).toBe(1); // restored
+    expect(wb.getValue('Sheet1!B1')).toBe('changed'); // restore refused
+    expect(mgr.get(cs.id)?.status).toBe('failed_partial');
+    expect(mgr.get(cs.id)?.unrecovered).toEqual(['Sheet1!B1']);
+  });
+
+  it('never reports rolled_back when a structural op may have run', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(failsAfterFirstOp(wb), 'wb-1');
+    const cs = await mgr.stage([
+      { kind: 'add_sheet', name: 'Report', reason: 'x' },
+      writeOp('Sheet1!A1', [[{ value: 1 }]]),
+    ]);
+
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/host failed mid-apply/);
+
+    expect(wb.getValue('Sheet1!A1')).toBeNull();
+    expect(mgr.get(cs.id)?.status).toBe('failed_partial');
+    expect(mgr.get(cs.id)?.unrecovered).toEqual(['add_sheet "Report" (not reverted)']);
+  });
+
+  it('keeps a set staged when it fails before any op reaches the workbook', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(failsAfterFirstOp(wb), 'wb-1');
+    const big = await mgr.stage([{ kind: 'clear_range', range: 'Sheet1!A1:Z5000', reason: 'too big' }]);
+
+    await expect(mgr.apply(big.id)).rejects.toThrow(/more than 100000 cells/);
+    expect(mgr.get(big.id)?.status).toBe('staged');
   });
 });

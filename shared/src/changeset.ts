@@ -63,14 +63,17 @@ export type ChangeOp =
     };
 
 /**
- * staged → applying → applied | failed_partial; applied → undoing → undone | failed_partial.
- * A set never returns to `staged` once ops have reached the workbook, except
- * after a verified rollback.
+ * staged → applying → applied | rolled_back | failed_partial;
+ * applied → undoing → undone | failed_partial.
+ * A set never returns to `staged` once ops have reached the workbook: a failed
+ * apply is rolled back from the snapshot and ends `rolled_back` when every
+ * cell is confirmed restored, `failed_partial` (with `unrecovered`) otherwise.
  */
 export type ChangeSetStatus =
   | 'staged'
   | 'applying'
   | 'applied'
+  | 'rolled_back'
   | 'failed_partial'
   | 'rejected'
   | 'undoing'
@@ -89,6 +92,11 @@ export interface ChangeSet {
   targets: SheetTarget[];
   /** Snapshot of affected ranges taken just before apply, for undo. */
   snapshots?: RangeSnapshot[];
+  /**
+   * After a failed rollback: cell addresses that could not be confirmed
+   * restored, plus structural ops that snapshots cannot revert.
+   */
+  unrecovered?: string[];
   /**
    * Undo fidelity. "full" = all ops are range-level and snapshot-restorable.
    * "partial" = contains structural ops (e.g. add_sheet) that undo can remove
