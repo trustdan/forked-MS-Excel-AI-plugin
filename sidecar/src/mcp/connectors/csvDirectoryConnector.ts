@@ -1,5 +1,6 @@
 import { readdirSync, statSync, existsSync } from 'node:fs';
 import { join, extname, relative } from 'node:path';
+import { z } from 'zod';
 import type {
   McpServerConfig,
   McpServerStatus,
@@ -13,6 +14,53 @@ import {
   loadAndParseLocalFile,
   parseTabularContent,
 } from '../../importers/tabular.js';
+import { parseArgs, toolDefinitions } from '../builtinTools.js';
+
+const relativePath = z.string().trim().min(1);
+
+const TOOLS = {
+  csv_list_files: {
+    description: 'List all CSV and TSV files in the approved directory, including file sizes and modification dates.',
+    parameters: z
+      .object({
+        subDir: z.string().optional().describe('Optional subfolder within the CSV directory to search'),
+      })
+      .strict(),
+  },
+  csv_read_preview: {
+    description: 'Read the header and top N rows of a CSV or TSV file to inspect its schema and sample values.',
+    parameters: z
+      .object({
+        relativePath: relativePath.describe('Relative path of the CSV or TSV file within the approved directory'),
+        maxRows: z.number().int().min(1).max(100).optional().describe('Maximum preview rows to return (default 10, max 100)'),
+      })
+      .strict(),
+  },
+  csv_query: {
+    description: 'Search and filter rows in a CSV or TSV file by column name and value substring.',
+    parameters: z
+      .object({
+        relativePath: relativePath.describe('Relative path of the CSV or TSV file'),
+        column: z.string().optional().describe('Column name to filter by (or empty to search all columns)'),
+        filterValue: z.string().optional().describe('Value or substring to match'),
+        limit: z.number().int().min(1).max(500).optional().describe('Maximum matching rows to return (default 100, max 500)'),
+      })
+      .strict(),
+  },
+  csv_stage_to_sheet: {
+    description:
+      'Parse a CSV or TSV file from the approved directory and stage its full content into an Excel worksheet change-set for user review.',
+    parameters: z
+      .object({
+        relativePath: relativePath.describe('Relative path of the CSV or TSV file'),
+        targetSheet: z.string().optional().describe('Target worksheet name (defaults to "Sheet1")'),
+        startCell: z.string().optional().describe('Top-left cell address (defaults to "A1")'),
+        hasHeaders: z.boolean().optional().describe('Whether row 1 contains headers (defaults to true)'),
+        reason: z.string().max(300).optional().describe('One-line justification for staging this CSV import'),
+      })
+      .strict(),
+  },
+};
 
 export class CsvDirectoryConnector implements McpClient {
   readonly id: string;
@@ -58,99 +106,7 @@ export class CsvDirectoryConnector implements McpClient {
   }
 
   async listTools(): Promise<McpToolDefinition[]> {
-    return [
-      {
-        name: 'csv_list_files',
-        description: 'List all CSV and TSV files in the approved directory, including file sizes and modification dates.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            subDir: {
-              type: 'string',
-              description: 'Optional subfolder within the CSV directory to search',
-            },
-          },
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'csv_read_preview',
-        description: 'Read the header and top N rows of a CSV or TSV file to inspect its schema and sample values.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            relativePath: {
-              type: 'string',
-              description: 'Relative path of the CSV or TSV file within the approved directory',
-            },
-            maxRows: {
-              type: 'number',
-              description: 'Maximum preview rows to return (default 10, max 100)',
-            },
-          },
-          required: ['relativePath'],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'csv_query',
-        description: 'Search and filter rows in a CSV or TSV file by column name and value substring.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            relativePath: {
-              type: 'string',
-              description: 'Relative path of the CSV or TSV file',
-            },
-            column: {
-              type: 'string',
-              description: 'Column name to filter by (or empty to search all columns)',
-            },
-            filterValue: {
-              type: 'string',
-              description: 'Value or substring to match',
-            },
-            limit: {
-              type: 'number',
-              description: 'Maximum matching rows to return (default 100, max 500)',
-            },
-          },
-          required: ['relativePath'],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'csv_stage_to_sheet',
-        description: 'Parse a CSV or TSV file from the approved directory and stage its full content into an Excel worksheet change-set for user review.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            relativePath: {
-              type: 'string',
-              description: 'Relative path of the CSV or TSV file',
-            },
-            targetSheet: {
-              type: 'string',
-              description: 'Target worksheet name (defaults to "Sheet1")',
-            },
-            startCell: {
-              type: 'string',
-              description: 'Top-left cell address (defaults to "A1")',
-            },
-            hasHeaders: {
-              type: 'boolean',
-              description: 'Whether row 1 contains headers (defaults to true)',
-            },
-            reason: {
-              type: 'string',
-              description: 'One-line justification for staging this CSV import',
-            },
-          },
-          required: ['relativePath'],
-          additionalProperties: false,
-        },
-      },
-    ];
+    return toolDefinitions(TOOLS);
   }
 
   async callTool(
@@ -165,7 +121,7 @@ export class CsvDirectoryConnector implements McpClient {
 
     switch (toolName) {
       case 'csv_list_files': {
-        const sub = String(args.subDir ?? '').trim();
+        const sub = (parseArgs(TOOLS.csv_list_files, args).subDir ?? '').trim();
         const targetDir = PathGuard.assertApproved(
           sub ? join(root, sub) : root,
           this.config.allowedPaths,
@@ -208,18 +164,14 @@ export class CsvDirectoryConnector implements McpClient {
       }
 
       case 'csv_read_preview': {
-        const relPath = String(args.relativePath ?? '').trim();
-        if (!relPath) {
-          return { content: [{ type: 'text', text: 'Error: relativePath is required' }], isError: true };
-        }
+        const { relativePath: relPath, maxRows = 10 } = parseArgs(TOOLS.csv_read_preview, args);
         const fullPath = PathGuard.assertApproved(
           join(root, relPath),
           this.config.allowedPaths,
           'csv_read_preview',
         );
-        const maxRows = Math.min(Math.max(1, Number(args.maxRows ?? 10)), 100);
 
-        const parsed = loadAndParseLocalFile(fullPath);
+        const parsed = loadAndParseLocalFile(fullPath, this.config.allowedPaths);
         const previewRows = parsed.rows.slice(0, maxRows);
         return {
           content: [
@@ -240,20 +192,16 @@ export class CsvDirectoryConnector implements McpClient {
       }
 
       case 'csv_query': {
-        const relPath = String(args.relativePath ?? '').trim();
-        if (!relPath) {
-          return { content: [{ type: 'text', text: 'Error: relativePath is required' }], isError: true };
-        }
+        const { relativePath: relPath, column = '', filterValue = '', limit = 100 } = parseArgs(TOOLS.csv_query, args);
         const fullPath = PathGuard.assertApproved(
           join(root, relPath),
           this.config.allowedPaths,
           'csv_query',
         );
-        const colFilter = String(args.column ?? '').trim().toLowerCase();
-        const filterVal = String(args.filterValue ?? '').trim().toLowerCase();
-        const limit = Math.min(Math.max(1, Number(args.limit ?? 100)), 500);
+        const colFilter = column.trim().toLowerCase();
+        const filterVal = filterValue.trim().toLowerCase();
 
-        const parsed = loadAndParseLocalFile(fullPath);
+        const parsed = loadAndParseLocalFile(fullPath, this.config.allowedPaths);
         if (parsed.rows.length === 0) {
           return {
             content: [{ type: 'text', text: JSON.stringify({ ok: true, matchingRows: 0, rows: [] }) }],
@@ -318,21 +266,19 @@ export class CsvDirectoryConnector implements McpClient {
       }
 
       case 'csv_stage_to_sheet': {
-        const relPath = String(args.relativePath ?? '').trim();
-        if (!relPath) {
-          return { content: [{ type: 'text', text: 'Error: relativePath is required' }], isError: true };
-        }
+        const staged = parseArgs(TOOLS.csv_stage_to_sheet, args);
+        const relPath = staged.relativePath;
         const fullPath = PathGuard.assertApproved(
           join(root, relPath),
           this.config.allowedPaths,
           'csv_stage_to_sheet',
         );
-        const targetSheet = String(args.targetSheet ?? 'Sheet1').trim();
-        const startCell = String(args.startCell ?? 'A1').trim();
-        const hasHeaders = args.hasHeaders !== false;
-        const reason = String(args.reason ?? `Import CSV: ${relPath}`);
+        const targetSheet = (staged.targetSheet ?? 'Sheet1').trim();
+        const startCell = (staged.startCell ?? 'A1').trim();
+        const hasHeaders = staged.hasHeaders !== false;
+        const reason = staged.reason || `Import CSV: ${relPath}`;
 
-        const parsed = loadAndParseLocalFile(fullPath);
+        const parsed = loadAndParseLocalFile(fullPath, this.config.allowedPaths);
         const ops = generateImportChangeOps({
           rows: parsed.rows,
           targetSheet,

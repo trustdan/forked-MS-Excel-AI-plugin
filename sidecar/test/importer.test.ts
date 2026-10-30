@@ -12,6 +12,7 @@ import {
   parseTabularContent,
   sanitizeFormulaInjection,
 } from '../src/importers/tabular.js';
+import { McpSecurityError } from '../src/mcp/pathGuard.js';
 
 describe('Local Tabular Importer (FEAT-02)', () => {
   let tempDir: string;
@@ -152,7 +153,7 @@ Footer text
       const file = join(tempDir, 'data.csv');
       writeFileSync(file, 'ID,Score\n101,95.5\n102,88');
 
-      const result = loadAndParseLocalFile(file);
+      const result = loadAndParseLocalFile(file, [tempDir]);
       expect(result.format).toBe('csv');
       expect(result.totalRows).toBe(3);
       expect(result.totalCols).toBe(2);
@@ -167,19 +168,27 @@ Footer text
       const file = join(tempDir, 'script.exe');
       writeFileSync(file, 'binary-data');
 
-      expect(() => loadAndParseLocalFile(file)).toThrow(/Unsupported file format/);
+      expect(() => loadAndParseLocalFile(file, [tempDir])).toThrow(/Unsupported file format/);
     });
 
     it('rejects non-existent files', () => {
       const file = join(tempDir, 'missing.csv');
-      expect(() => loadAndParseLocalFile(file)).toThrow(/File not found/);
+      expect(() => loadAndParseLocalFile(file, [tempDir])).toThrow(/File not found/);
+    });
+
+    it('refuses files outside the approved folders before reading them (F9)', () => {
+      const file = join(tempDir, 'private.csv');
+      writeFileSync(file, 'Secret\nPRIVATE-MARKER');
+
+      expect(() => loadAndParseLocalFile(file, [])).toThrow(McpSecurityError);
+      expect(() => loadAndParseLocalFile(file, [join(tempDir, 'other')])).toThrow(McpSecurityError);
     });
 
     it('rejects files exceeding byte limit', () => {
       const file = join(tempDir, 'huge.csv');
       writeFileSync(file, 'A'.repeat(2048));
 
-      expect(() => loadAndParseLocalFile(file, { maxBytes: 1024 })).toThrow(/exceeds limit/);
+      expect(() => loadAndParseLocalFile(file, [tempDir], { maxBytes: 1024 })).toThrow(/exceeds limit/);
     });
   });
 

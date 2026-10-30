@@ -29,6 +29,7 @@ export class Session {
     private readonly ledger: Ledger,
     private readonly memory: MemoryStore,
     private readonly mcpManager?: McpManager,
+    private readonly getApprovedPaths: () => readonly string[] = () => [],
   ) {
     this.changeSets = new ChangeSetManager(executor, workbookId);
   }
@@ -92,6 +93,7 @@ export class Session {
         userMessage: message + memoryNote,
         abortSignal: abortController.signal,
         mcpManager: this.mcpManager,
+        approvedPaths: this.getApprovedPaths(),
         onEvent: (ev) => this.emit(ev),
         onUsage: (usage) => {
           totalIn += usage.inputTokens;

@@ -23,7 +23,7 @@ import { BridgeExecutor } from './bridge.js';
 import { Session } from './session.js';
 import { assertLoopbackUrl, guardedFetch } from './networkGuard.js';
 import { loadAndParseLocalFile, parseTabularContent } from './importers/tabular.js';
-import { McpManager, PathGuard } from './mcp/index.js';
+import { McpManager, McpSecurityError, PathGuard } from './mcp/index.js';
 
 const SIDECAR_VERSION = '0.1.0';
 const MAX_CACHED_SESSIONS = 50;
@@ -344,7 +344,7 @@ export async function startServer(options: {
         }
         try {
           if (parsed.data.filePath) {
-            const result = loadAndParseLocalFile(parsed.data.filePath);
+            const result = loadAndParseLocalFile(parsed.data.filePath, loadSettings().approvedPaths);
             const headers = result.rows[0]?.map((c) => String(c ?? '')) ?? [];
             sendJson(res, 200, {
               ok: true,
@@ -367,7 +367,11 @@ export async function startServer(options: {
             });
           }
         } catch (e) {
-          sendJson(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
+          if (e instanceof McpSecurityError) {
+            sendJson(res, 403, { ok: false, error: 'File is not in an approved folder.' });
+          } else {
+            sendJson(res, 400, { ok: false, error: e instanceof Error ? e.message : String(e) });
+          }
         }
         return;
       }
@@ -625,6 +629,7 @@ export async function startServer(options: {
                 ledger,
                 memory,
                 mcpManager,
+                () => loadSettings().approvedPaths,
               );
               if (sessions.size >= MAX_CACHED_SESSIONS) {
                 const oldestKey = sessions.keys().next().value;

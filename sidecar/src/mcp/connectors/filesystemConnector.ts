@@ -1,5 +1,6 @@
-import { readdirSync, statSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { z } from 'zod';
 import type {
   McpServerConfig,
   McpServerStatus,
@@ -8,8 +9,53 @@ import type {
 } from '@excelai/shared';
 import { PathGuard } from '../pathGuard.js';
 import type { McpClient } from '../types.js';
+import { parseArgs, toolDefinitions } from '../builtinTools.js';
+import { readFileCapped } from '../../boundedRead.js';
 
 const MAX_FILE_READ_BYTES = 256 * 1024; // 256 KB max for text reads
+
+const TOOLS = {
+  fs_list_directory: {
+    description: 'List contents of a directory within the approved filesystem root.',
+    parameters: z
+      .object({
+        path: z.string().optional().describe('Relative path within the approved root (empty for root)'),
+      })
+      .strict(),
+  },
+  fs_read_file: {
+    description: 'Read the text content of a file within the approved filesystem root (up to 256 KB).',
+    parameters: z
+      .object({
+        path: z.string().trim().min(1).describe('Relative path of the file to read'),
+        maxBytes: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_FILE_READ_BYTES)
+          .optional()
+          .describe('Maximum bytes to read (default 65536, max 262144)'),
+      })
+      .strict(),
+  },
+  fs_search_files: {
+    description: 'Search for files by name or extension within the approved directory tree.',
+    parameters: z
+      .object({
+        query: z.string().trim().min(1).describe('Search term to match against file names'),
+        maxResults: z.number().int().min(1).max(100).optional().describe('Maximum matches to return (default 50, max 100)'),
+      })
+      .strict(),
+  },
+  fs_get_metadata: {
+    description: 'Get file system metadata for a path (size, timestamps, type).',
+    parameters: z
+      .object({
+        path: z.string().describe('Relative path within the approved root'),
+      })
+      .strict(),
+  },
+};
 
 export class FilesystemConnector implements McpClient {
   readonly id: string;
@@ -55,75 +101,7 @@ export class FilesystemConnector implements McpClient {
   }
 
   async listTools(): Promise<McpToolDefinition[]> {
-    return [
-      {
-        name: 'fs_list_directory',
-        description: 'List contents of a directory within the approved filesystem root.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            path: {
-              type: 'string',
-              description: 'Relative path within the approved root (empty for root)',
-            },
-          },
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'fs_read_file',
-        description: 'Read the text content of a file within the approved filesystem root (up to 256 KB).',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            path: {
-              type: 'string',
-              description: 'Relative path of the file to read',
-            },
-            maxBytes: {
-              type: 'number',
-              description: 'Maximum bytes to read (default 65536, max 262144)',
-            },
-          },
-          required: ['path'],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'fs_search_files',
-        description: 'Search for files by name or extension within the approved directory tree.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            query: {
-              type: 'string',
-              description: 'Search term to match against file names',
-            },
-            maxResults: {
-              type: 'number',
-              description: 'Maximum matches to return (default 50, max 100)',
-            },
-          },
-          required: ['query'],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'fs_get_metadata',
-        description: 'Get file system metadata for a path (size, timestamps, type).',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            path: {
-              type: 'string',
-              description: 'Relative path within the approved root',
-            },
-          },
-          required: ['path'],
-          additionalProperties: false,
-        },
-      },
-    ];
+    return toolDefinitions(TOOLS);
   }
 
   async callTool(
@@ -138,7 +116,7 @@ export class FilesystemConnector implements McpClient {
 
     switch (toolName) {
       case 'fs_list_directory': {
-        const sub = String(args.path ?? '').trim();
+        const sub = (parseArgs(TOOLS.fs_list_directory, args).path ?? '').trim();
         const targetDir = PathGuard.assertApproved(
           sub ? join(root, sub) : root,
           this.config.allowedPaths,
@@ -180,10 +158,7 @@ export class FilesystemConnector implements McpClient {
       }
 
       case 'fs_read_file': {
-        const rel = String(args.path ?? '').trim();
-        if (!rel) {
-          return { content: [{ type: 'text', text: 'Error: path is required' }], isError: true };
-        }
+        const { path: rel, maxBytes = 64 * 1024 } = parseArgs(TOOLS.fs_read_file, args);
         const fullPath = PathGuard.assertApproved(
           join(root, rel),
           this.config.allowedPaths,
@@ -193,15 +168,11 @@ export class FilesystemConnector implements McpClient {
         if (!existsSync(fullPath)) {
           return { content: [{ type: 'text', text: `File not found: ${rel}` }], isError: true };
         }
-        const stat = statSync(fullPath);
-        if (!stat.isFile()) {
+        if (!statSync(fullPath).isFile()) {
           return { content: [{ type: 'text', text: `Path is not a regular file: ${rel}` }], isError: true };
         }
 
-        const maxBytes = Math.min(Math.max(1, Number(args.maxBytes ?? 64 * 1024)), MAX_FILE_READ_BYTES);
-        const buf = readFileSync(fullPath);
-        const isTruncated = buf.length > maxBytes;
-        const slice = isTruncated ? buf.subarray(0, maxBytes) : buf;
+        const { bytes: slice, size, truncated: isTruncated } = readFileCapped(fullPath, maxBytes);
 
         // Check for binary null byte
         if (slice.includes(0)) {
@@ -212,7 +183,7 @@ export class FilesystemConnector implements McpClient {
                 text: JSON.stringify({
                   ok: false,
                   error: 'Cannot read binary file as text.',
-                  fileSizeBytes: stat.size,
+                  fileSizeBytes: size,
                 }),
               },
             ],
@@ -228,7 +199,7 @@ export class FilesystemConnector implements McpClient {
               text: JSON.stringify({
                 ok: true,
                 path: rel,
-                sizeBytes: stat.size,
+                sizeBytes: size,
                 bytesRead: slice.length,
                 truncated: isTruncated,
                 content: text,
@@ -239,11 +210,8 @@ export class FilesystemConnector implements McpClient {
       }
 
       case 'fs_search_files': {
-        const q = String(args.query ?? '').trim().toLowerCase();
-        if (!q) {
-          return { content: [{ type: 'text', text: 'Error: query is required' }], isError: true };
-        }
-        const maxResults = Math.min(Math.max(1, Number(args.maxResults ?? 50)), 100);
+        const { query, maxResults = 50 } = parseArgs(TOOLS.fs_search_files, args);
+        const q = query.toLowerCase();
 
         const results: Array<{ relativePath: string; isDirectory: boolean; sizeBytes: number }> = [];
         const scan = (currentDir: string): void => {
@@ -282,7 +250,7 @@ export class FilesystemConnector implements McpClient {
       }
 
       case 'fs_get_metadata': {
-        const rel = String(args.path ?? '').trim();
+        const rel = parseArgs(TOOLS.fs_get_metadata, args).path.trim();
         const fullPath = PathGuard.assertApproved(
           rel ? join(root, rel) : root,
           this.config.allowedPaths,
