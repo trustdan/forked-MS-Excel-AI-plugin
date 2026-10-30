@@ -286,6 +286,23 @@ describe('sidecar WebSocket hardening', () => {
     bystander.close();
   });
 
+  it('reports a change-set it no longer holds (e.g. after a restart) as unknown', async () => {
+    const { base, token } = await boot();
+    const ws = await connect(base, token);
+    expect((await hello(ws, token, 'wb-restart')).ok).toBe(true);
+
+    const status = new Promise<unknown>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString()) as { type: string; payload: { kind?: string } };
+        if (msg.type === 'agent_event' && msg.payload.kind === 'changeset_status') resolve(msg.payload);
+      });
+    });
+    ws.send(JSON.stringify({ v: 1, id: 'u', type: 'undo_changeset', payload: { changeSetId: 'gone' } }));
+
+    expect(await status).toEqual({ kind: 'changeset_status', changeSetId: 'gone', status: 'unknown' });
+    ws.close();
+  });
+
   it('rejects frames larger than the payload cap', async () => {
     const { base, token } = await boot();
     const ws = await connect(base, token);

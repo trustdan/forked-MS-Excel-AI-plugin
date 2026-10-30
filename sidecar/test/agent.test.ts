@@ -142,7 +142,7 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(stagedId).toBeDefined();
     const cs = changeSets.get(stagedId!)!;
     expect(cs.ops).toHaveLength(2);
-    expect(cs.undoFidelity).toBe('partial'); // formatting is not snapshot-restorable yet
+    expect(cs.undoFidelity).toBe('values_only'); // formatting is not snapshot-restorable yet
 
     const result = await changeSets.apply(stagedId!);
     expect(result.ok).toBe(true);

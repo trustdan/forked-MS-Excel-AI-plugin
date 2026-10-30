@@ -1,4 +1,4 @@
-import type { ChangePreviewItem } from '@excelai/shared';
+import type { ChangePreviewItem, ChangeSetStatus, UndoFidelity } from '@excelai/shared';
 
 export type ActivityStep =
   | { kind: 'thinking'; text: string; durationMs?: number }
@@ -21,7 +21,9 @@ export type ChatItem =
       kind: 'changeset';
       id: string;
       preview: ChangePreviewItem[];
-      status: 'staged' | 'applied' | 'rejected' | 'undone';
+      undoFidelity: UndoFidelity;
+      /** As last reported by the sidecar; `unknown` once it no longer holds the set. */
+      status: ChangeSetStatus | 'unknown';
     };
 
 export type ProviderKind = 'anthropic' | 'openai' | 'openai-compatible' | 'embedded';

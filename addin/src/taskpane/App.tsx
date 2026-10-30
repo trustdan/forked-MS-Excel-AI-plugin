@@ -209,15 +209,17 @@ export function applyAgentEventToItems(prev: ChatItem[], ev: AgentEventPayload):
     case 'changeset_staged':
       return [
         ...closeActiveActivities(prev),
-        { kind: 'changeset', id: ev.changeSetId, preview: ev.preview, status: 'staged' },
+        {
+          kind: 'changeset',
+          id: ev.changeSetId,
+          preview: ev.preview,
+          undoFidelity: ev.undoFidelity,
+          status: 'staged',
+        },
       ];
-    case 'changeset_applied':
+    case 'changeset_status':
       return prev.map((it) =>
-        it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: 'applied' } : it,
-      );
-    case 'changeset_undone':
-      return prev.map((it) =>
-        it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: 'undone' } : it,
+        it.kind === 'changeset' && it.id === ev.changeSetId ? { ...it, status: ev.status } : it,
       );
     case 'error':
       return [...closeActiveActivities(prev), { kind: 'error', text: ev.message }];

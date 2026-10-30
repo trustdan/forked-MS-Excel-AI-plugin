@@ -57,6 +57,7 @@ export function ChatBubble({
         <ChangeSetCard
           id={item.id}
           preview={item.preview}
+          undoFidelity={item.undoFidelity}
           status={item.status}
           onApprove={onApprove}
           onReject={onReject}

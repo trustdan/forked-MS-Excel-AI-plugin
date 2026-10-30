@@ -126,29 +126,46 @@ export class Session {
   }
 
   async handleApprove(changeSetId: string): Promise<void> {
+    const existing = this.changeSets.get(changeSetId);
+    if (!this.known(changeSetId)) return;
+    // A duplicate approval: the first handler reports the outcome.
+    if (existing?.status === 'applying') return;
     try {
-      const existing = this.changeSets.get(changeSetId);
-      if (existing?.status === 'applied') {
-        this.emit({ kind: 'changeset_applied', changeSetId });
-        return;
-      }
-      // A duplicate approval: the first handler reports the outcome.
-      if (existing?.status === 'applying') return;
-      const result = await this.changeSets.apply(changeSetId);
-      if (result.ok) {
-        this.emit({ kind: 'changeset_applied', changeSetId });
-      } else {
-        this.emit({
-          kind: 'error',
-          message: this.describeFailure(
-            changeSetId,
-            `Change-set verification failed:\n${result.problems.join('\n')}`,
-          ),
-        });
+      if (existing?.status !== 'applied') {
+        const result = await this.changeSets.apply(changeSetId);
+        if (!result.ok) {
+          this.emit({
+            kind: 'error',
+            message: this.describeFailure(
+              changeSetId,
+              `Change-set verification failed:\n${result.problems.join('\n')}`,
+            ),
+          });
+        }
       }
     } catch (e) {
       this.emit({ kind: 'error', message: this.describeFailure(changeSetId, e) });
+    } finally {
+      this.emitStatus(changeSetId);
     }
+  }
+
+  /** Reports an id this sidecar does not hold (e.g. staged before a restart) as `unknown`. */
+  private known(changeSetId: string): boolean {
+    if (this.changeSets.get(changeSetId)) return true;
+    this.emit({
+      kind: 'error',
+      message: 'That change-set is no longer available (the sidecar may have restarted). Ask again to re-propose it.',
+    });
+    this.emitStatus(changeSetId);
+    return false;
+  }
+
+  /** Tells the add-in where a change-set ended up, so its card matches the sidecar. */
+  private emitStatus(changeSetId: string): void {
+    const status = this.changeSets.get(changeSetId)?.status ?? 'unknown';
+    if (status === 'applying' || status === 'undoing') return;
+    this.emit({ kind: 'changeset_status', changeSetId, status });
   }
 
   private describeFailure(changeSetId: string, e: unknown): string {
@@ -164,26 +181,31 @@ export class Session {
     const shown = cs.unrecovered.slice(0, MAX_UNRECOVERED_SHOWN).join(', ');
     const more = cs.unrecovered.length - MAX_UNRECOVERED_SHOWN;
     return (
-      `${message}\nRollback was incomplete; these were not restored: ${shown}` +
+      `${message}\nThe workbook may be partially changed; these were not restored: ${shown}` +
       (more > 0 ? ` and ${more} more` : '')
     );
   }
 
   handleReject(changeSetId: string): void {
+    if (!this.known(changeSetId)) return;
     try {
       this.changeSets.reject(changeSetId);
     } catch (e) {
       this.emit({ kind: 'error', message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.emitStatus(changeSetId);
     }
   }
 
   async handleUndo(changeSetId: string): Promise<void> {
+    if (!this.known(changeSetId)) return;
     if (this.changeSets.get(changeSetId)?.status === 'undoing') return;
     try {
       await this.changeSets.undo(changeSetId);
-      this.emit({ kind: 'changeset_undone', changeSetId });
     } catch (e) {
       this.emit({ kind: 'error', message: this.describeFailure(changeSetId, e) });
+    } finally {
+      this.emitStatus(changeSetId);
     }
   }
 }

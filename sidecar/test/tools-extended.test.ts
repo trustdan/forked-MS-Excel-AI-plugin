@@ -108,7 +108,7 @@ describe('sorting', () => {
         },
       },
     ]);
-    expect(cs.undoFidelity).toBe('full'); // sort is snapshot-restorable
+    expect(cs.undoFidelity).toBe('values_only'); // sort moves formatting, which snapshots don't hold
 
     expect(wb.getValue('Sheet1!A1')).toBe('Name'); // header pinned
     expect(wb.getValue('Sheet1!A2')).toBe('alice');
