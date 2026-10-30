@@ -130,6 +130,8 @@ export class Session {
         this.emit({ kind: 'changeset_applied', changeSetId });
         return;
       }
+      // A duplicate approval: the first handler reports the outcome.
+      if (existing?.status === 'applying') return;
       const result = await this.changeSets.apply(changeSetId);
       if (result.ok) {
         this.emit({ kind: 'changeset_applied', changeSetId });
@@ -140,8 +142,15 @@ export class Session {
         });
       }
     } catch (e) {
-      this.emit({ kind: 'error', message: e instanceof Error ? e.message : String(e) });
+      this.emit({ kind: 'error', message: this.describeFailure(changeSetId, e) });
     }
+  }
+
+  private describeFailure(changeSetId: string, e: unknown): string {
+    const message = e instanceof Error ? e.message : String(e);
+    return this.changeSets.get(changeSetId)?.status === 'failed_partial'
+      ? `Change-set failed partway; the workbook may be partially changed. ${message}`
+      : message;
   }
 
   handleReject(changeSetId: string): void {
@@ -153,11 +162,12 @@ export class Session {
   }
 
   async handleUndo(changeSetId: string): Promise<void> {
+    if (this.changeSets.get(changeSetId)?.status === 'undoing') return;
     try {
       await this.changeSets.undo(changeSetId);
       this.emit({ kind: 'changeset_undone', changeSetId });
     } catch (e) {
-      this.emit({ kind: 'error', message: e instanceof Error ? e.message : String(e) });
+      this.emit({ kind: 'error', message: this.describeFailure(changeSetId, e) });
     }
   }
 }

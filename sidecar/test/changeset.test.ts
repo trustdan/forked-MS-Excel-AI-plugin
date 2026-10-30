@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { WorkbookEmulator } from '../src/workbook/emulator.js';
 import { ChangeSetManager } from '../src/changeset/manager.js';
+import type { WorkbookExecutor } from '../src/workbook/executor.js';
 
 describe('change-set lifecycle', () => {
   it('stages, previews, applies and undoes a write', async () => {
@@ -194,5 +195,123 @@ describe('exact sheet targeting (F1)', () => {
     await wb.applyOps([{ kind: 'rename_sheet', name: 'A', newName: 'C', reason: 'x' }]);
     const after = (await wb.getWorkbookMap()).sheets;
     expect(after.find((s) => s.name === 'C')?.id).toBe(a!.id);
+  });
+});
+
+describe('change-set serialization (F3)', () => {
+  const insertRow = { kind: 'insert_rows', sheet: 'Sheet1', at: 0, count: 1, reason: 'header row' } as const;
+
+  /** Emulator wrapper that yields on every call and logs which change-set phase ran. */
+  function tracingExecutor(wb: WorkbookEmulator, log: string[]): WorkbookExecutor {
+    const tick = () => new Promise((r) => setTimeout(r, 1));
+    return {
+      getWorkbookMap: async () => (await tick(), wb.getWorkbookMap()),
+      readRange: async (range) => (log.push(`read ${range}`), await tick(), wb.readRange(range)),
+      find: (q, s) => wb.find(q, s),
+      applyOps: async (ops) => {
+        log.push(`apply ${ops.map((op) => ('range' in op ? op.range : op.kind)).join(',')}`);
+        await tick();
+        return wb.applyOps(ops);
+      },
+    };
+  }
+
+  it('applies once when the same set is approved twice at the same time', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A2', 'marker');
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([insertRow]);
+
+    const [a, b] = await Promise.all([mgr.apply(cs.id), mgr.apply(cs.id)]);
+
+    expect(a).toEqual({ ok: true, problems: [] });
+    expect(b).toEqual(a);
+    expect(wb.getValue('Sheet1!A3')).toBe('marker');
+    expect(wb.getValue('Sheet1!A4')).toBeNull();
+    expect(mgr.get(cs.id)?.status).toBe('applied');
+  });
+
+  it('refuses a reject that races an approval', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([insertRow]);
+
+    const applying = mgr.apply(cs.id);
+    expect(mgr.get(cs.id)?.status).toBe('applying');
+    expect(() => mgr.reject(cs.id)).toThrow(/already in progress/);
+    await applying;
+    expect(mgr.get(cs.id)?.status).toBe('applied');
+  });
+
+  it('refuses an undo that races an approval, and shares a duplicate undo', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 'old');
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([
+      { kind: 'write_range', range: 'Sheet1!A1', cells: [[{ value: 'new' }]], reason: 'x' },
+    ]);
+
+    const [applied, undo] = await Promise.allSettled([mgr.apply(cs.id), mgr.undo(cs.id)]);
+    expect(applied.status).toBe('fulfilled');
+    expect(undo.status).toBe('rejected');
+    expect(wb.getValue('Sheet1!A1')).toBe('new');
+
+    const first = mgr.undo(cs.id);
+    expect(mgr.get(cs.id)?.status).toBe('undoing');
+    await Promise.all([first, mgr.undo(cs.id)]);
+    expect(wb.getValue('Sheet1!A1')).toBe('old');
+    expect(mgr.get(cs.id)?.status).toBe('undone');
+  });
+
+  it('never interleaves snapshot/apply/verify phases of different sets on one workbook', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const log: string[] = [];
+    const mgr = new ChangeSetManager(tracingExecutor(wb, log), 'wb-1');
+    const write = (range: string) =>
+      ({ kind: 'write_range', range, cells: [[{ value: 1 }]], reason: 'x' }) as const;
+    const a = await mgr.stage([write('Sheet1!A1')]);
+    const b = await mgr.stage([write('Sheet1!B1')]);
+
+    await Promise.all([mgr.apply(a.id), mgr.apply(b.id)]);
+
+    expect(log).toEqual([
+      'read Sheet1!A1',
+      'apply Sheet1!A1',
+      'read Sheet1!A1',
+      'read Sheet1!B1',
+      'apply Sheet1!B1',
+      'read Sheet1!B1',
+    ]);
+  });
+
+  it('marks a set failed_partial, not staged, when apply fails after touching the workbook', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(
+      {
+        ...tracingExecutor(wb, []),
+        applyOps: async () => {
+          throw new Error('host lost the workbook');
+        },
+      },
+      'wb-1',
+    );
+    const cs = await mgr.stage([insertRow]);
+
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/host lost the workbook/);
+    expect(mgr.get(cs.id)?.status).toBe('failed_partial');
+    await expect(mgr.apply(cs.id)).rejects.toThrow(/is failed_partial/);
+  });
+
+  it('releases the workbook lock after a failed apply', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const bad = await mgr.stage([
+      { kind: 'write_range', range: 'Sheet1!A1:B2', cells: [[{ value: 1 }]], reason: 'bad dims' },
+    ]);
+    const good = await mgr.stage([insertRow]);
+
+    const [first, second] = await Promise.allSettled([mgr.apply(bad.id), mgr.apply(good.id)]);
+    expect(first.status).toBe('rejected');
+    expect(second.status).toBe('fulfilled');
   });
 });
