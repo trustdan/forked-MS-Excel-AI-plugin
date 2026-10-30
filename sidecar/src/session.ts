@@ -8,6 +8,8 @@ import type { Ledger } from './ledger.js';
 import type { MemoryStore } from './memory/store.js';
 import type { McpManager } from './mcp/manager.js';
 
+const MAX_UNRECOVERED_SHOWN = 20;
+
 /**
  * One session per connected workbook. Sessions are scoped by workbookId so
  * multiple open workbooks (or Excel instances) never share state.
@@ -138,7 +140,10 @@ export class Session {
       } else {
         this.emit({
           kind: 'error',
-          message: `Change-set verification failed and was rolled back:\n${result.problems.join('\n')}`,
+          message: this.describeFailure(
+            changeSetId,
+            `Change-set verification failed:\n${result.problems.join('\n')}`,
+          ),
         });
       }
     } catch (e) {
@@ -148,9 +153,20 @@ export class Session {
 
   private describeFailure(changeSetId: string, e: unknown): string {
     const message = e instanceof Error ? e.message : String(e);
-    return this.changeSets.get(changeSetId)?.status === 'failed_partial'
-      ? `Change-set failed partway; the workbook may be partially changed. ${message}`
-      : message;
+    const cs = this.changeSets.get(changeSetId);
+    if (cs?.status === 'rolled_back') {
+      return `${message}\nThe change-set was rolled back; the workbook is unchanged.`;
+    }
+    if (cs?.status !== 'failed_partial') return message;
+    if (!cs.unrecovered?.length) {
+      return `Change-set failed partway; the workbook may be partially changed. ${message}`;
+    }
+    const shown = cs.unrecovered.slice(0, MAX_UNRECOVERED_SHOWN).join(', ');
+    const more = cs.unrecovered.length - MAX_UNRECOVERED_SHOWN;
+    return (
+      `${message}\nRollback was incomplete; these were not restored: ${shown}` +
+      (more > 0 ? ` and ${more} more` : '')
+    );
   }
 
   handleReject(changeSetId: string): void {

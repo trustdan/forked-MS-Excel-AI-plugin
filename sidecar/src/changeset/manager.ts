@@ -14,9 +14,25 @@ import { assertTargetsUnchanged, resolveSheetTargets } from './targets.js';
 
 const MAX_SNAPSHOT_CELLS = 100_000;
 
+// Structural/format ops are not snapshot-restorable in v1: undo restores
+// values and formulas exactly, but not sheet structure or formatting.
+const NON_RESTORABLE: ChangeOp['kind'][] = [
+  'add_sheet',
+  'rename_sheet',
+  'delete_sheet',
+  'format_range',
+  'insert_rows',
+  'delete_rows',
+  'insert_cols',
+  'delete_cols',
+];
+
 export interface ApplyResult {
   ok: boolean;
-  /** Verification problems found after apply (apply is rolled back if any). */
+  /**
+   * Verification problems found after apply. When there are any, the set is
+   * rolled back: its status says whether that fully succeeded.
+   */
   problems: string[];
 }
 
@@ -47,18 +63,6 @@ export class ChangeSetManager {
   /** Resolves sheet targets against the live workbook; throws on an unknown sheet. */
   async stage(stagedOps: ChangeOp[]): Promise<ChangeSet> {
     const { ops, targets } = resolveSheetTargets(stagedOps, await this.executor.getWorkbookMap());
-    // Structural/format ops are not snapshot-restorable in v1: undo restores
-    // values and formulas exactly, but not sheet structure or formatting.
-    const NON_RESTORABLE: ChangeOp['kind'][] = [
-      'add_sheet',
-      'rename_sheet',
-      'delete_sheet',
-      'format_range',
-      'insert_rows',
-      'delete_rows',
-      'insert_cols',
-      'delete_cols',
-    ];
     const hasStructural = ops.some((op) => NON_RESTORABLE.includes(op.kind));
     const cs: ChangeSet = {
       id: randomUUID(),
@@ -211,17 +215,48 @@ export class ChangeSetManager {
 
       if (problems.length > 0 && beforeErrors === 0) {
         // Regression introduced by this change-set: roll back.
-        await this.restoreSnapshots(cs);
-        cs.status = 'staged';
+        await this.rollback(cs);
         return { ok: false, problems };
       }
 
       cs.status = 'applied';
       return { ok: true, problems: [] };
     } catch (e) {
-      // E2b adds rollback here; until then, say the workbook may be half-changed.
-      cs.status = touched ? 'failed_partial' : 'staged';
+      if (touched) await this.rollback(cs);
+      else cs.status = 'staged';
       throw e;
+    }
+  }
+
+  /**
+   * Restores every snapshot, then re-reads it to confirm. Ends `rolled_back`
+   * only when every cell matches its snapshot and no structural op ran;
+   * otherwise `failed_partial`, listing what could not be confirmed. Never throws.
+   */
+  private async rollback(cs: ChangeSet): Promise<void> {
+    const unrecovered: string[] = [];
+    for (const snap of cs.snapshots ?? []) {
+      try {
+        await this.executor.applyOps([restoreOp(snap, 'rollback: restore snapshot')]);
+      } catch {
+        // The re-read below reports whatever stayed changed.
+      }
+      let now: CellData[][] | undefined;
+      try {
+        now = await this.executor.readRange(snap.range);
+      } catch {
+        now = undefined;
+      }
+      unrecovered.push(...unrestoredCells(snap, now));
+    }
+    for (const op of cs.ops) {
+      if (NON_RESTORABLE.includes(op.kind)) unrecovered.push(describeStructural(op));
+    }
+    if (unrecovered.length > 0) {
+      cs.unrecovered = unrecovered;
+      cs.status = 'failed_partial';
+    } else {
+      cs.status = 'rolled_back';
     }
   }
 
@@ -241,19 +276,7 @@ export class ChangeSetManager {
   }
 
   private async restoreSnapshots(cs: ChangeSet): Promise<void> {
-    const ops: ChangeOp[] = [];
-    for (const snap of cs.snapshots ?? []) {
-      ops.push({
-        kind: 'write_range',
-        range: snap.range,
-        cells: snap.cells.map((row) =>
-          row.map((cell) =>
-            cell.formula !== undefined ? { formula: cell.formula } : { value: cell.value },
-          ),
-        ),
-        reason: 'undo: restore snapshot',
-      });
-    }
+    const ops = (cs.snapshots ?? []).map((snap) => restoreOp(snap, 'undo: restore snapshot'));
     if (ops.length > 0) await this.executor.applyOps(ops);
   }
 
@@ -267,6 +290,58 @@ export class ChangeSetManager {
       throw new Error(`Change-set ${id} is ${cs.status}, expected ${expected}`);
     }
     return cs;
+  }
+}
+
+function restoreOp(snap: RangeSnapshot, reason: string): ChangeOp {
+  return {
+    kind: 'write_range',
+    range: snap.range,
+    cells: snap.cells.map((row) =>
+      row.map((cell) => (cell.formula !== undefined ? { formula: cell.formula } : { value: cell.value })),
+    ),
+    reason,
+  };
+}
+
+/** Addresses of snapshot cells that do not hold their snapshotted content (all of them if unreadable). */
+function unrestoredCells(snap: RangeSnapshot, now: CellData[][] | undefined): string[] {
+  const addr = parseA1(snap.range);
+  const out: string[] = [];
+  for (const [r, row] of snap.cells.entries()) {
+    for (const [c, want] of row.entries()) {
+      const got = now?.[r]?.[c];
+      const restored =
+        got !== undefined &&
+        (want.formula !== undefined
+          ? got.formula === want.formula
+          : got.formula === undefined && got.value === want.value);
+      if (!restored) {
+        const row0 = addr.startRow + r;
+        const col0 = addr.startCol + c;
+        out.push(formatA1({ sheet: addr.sheet, startRow: row0, startCol: col0, endRow: row0, endCol: col0 }));
+      }
+    }
+  }
+  return out;
+}
+
+function describeStructural(op: ChangeOp): string {
+  switch (op.kind) {
+    case 'add_sheet':
+    case 'delete_sheet':
+      return `${op.kind} "${op.name}" (not reverted)`;
+    case 'rename_sheet':
+      return `rename_sheet "${op.name}" → "${op.newName}" (not reverted)`;
+    case 'format_range':
+      return `format_range ${op.range} (not reverted)`;
+    case 'insert_rows':
+    case 'delete_rows':
+    case 'insert_cols':
+    case 'delete_cols':
+      return `${op.kind} ${op.sheet} at ${op.at} ×${op.count} (not reverted)`;
+    default:
+      return `${op.kind} (not reverted)`;
   }
 }
 
