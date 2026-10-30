@@ -69,75 +69,90 @@ describe('ChangeSetCard', () => {
     expect(onUndo).toHaveBeenCalledWith('cs-2');
   });
 
-  it('applyOps and readRange fall back to activeWorksheet instead of throwing ItemNotFound ("The requested resource doesn\'t exist.") when Sheet1 is missing', async () => {
-    const { applyOps, readRange } = await import('../src/officeBridge.js');
+  it('shows the sheet each staged change targets', () => {
+    render(
+      <ChangeSetCard
+        id="cs-3"
+        preview={[
+          { op: { kind: 'clear_range', range: "'2025 Payroll'!A1:B2", reason: 'reset' } },
+          { op: { kind: 'add_sheet', name: 'Summary', reason: 'new output' } },
+        ]}
+        status="staged"
+        onApprove={() => {}}
+        onReject={() => {}}
+        onUndo={() => {}}
+      />,
+    );
+    expect(screen.getByText('Sheets: 2025 Payroll, Summary')).toBeDefined();
+  });
+});
 
-    let writtenFormulas: unknown[][] | null = null;
-    const activeRange = {
-      values: [['Cash', 'Raw Materials'], [401900, 419500]],
-      formulas: [['Cash', 'Raw Materials'], [401900, 419500]],
-      load: vi.fn(),
-      get setFormulas() {
-        return writtenFormulas;
-      },
-      set formulas_setter(v: unknown[][]) {
-        writtenFormulas = v;
-      },
-    };
-    Object.defineProperty(activeRange, 'formulas', {
-      get: () => writtenFormulas ?? [['Cash', 'Raw Materials'], [401900, 419500]],
-      set: (v: unknown[][]) => {
-        writtenFormulas = v;
-      },
-    });
-
-    const activeWorksheet = {
-      name: '2025 Starting Balances',
-      getRange: vi.fn(() => activeRange),
-    };
-
+describe('officeBridge sheet targeting', () => {
+  /** Minimal Excel.run fake over the given worksheets; the first one is active. */
+  function installExcel(sheetNames: string[]) {
+    const written = new Map<string, unknown[][]>();
+    const worksheets = sheetNames.map((name) => ({
+      name,
+      getRange: vi.fn((address: string) => {
+        const range = {
+          values: [[1]],
+          formulas: [[1]],
+          load: vi.fn(),
+        };
+        Object.defineProperty(range, 'formulas', {
+          get: () => [[1]],
+          set: (v: unknown[][]) => written.set(`${name}!${address}`, v),
+        });
+        return range;
+      }),
+    }));
     (globalThis as unknown as { Excel: unknown }).Excel = {
-      run: async (cb: (ctx: unknown) => Promise<unknown>) => {
-        const ctx = {
+      run: async (cb: (ctx: unknown) => Promise<unknown>) =>
+        cb({
           sync: vi.fn(async () => {}),
           workbook: {
             worksheets: {
-              items: [activeWorksheet],
+              items: worksheets,
               load: vi.fn(),
-              getActiveWorksheet: () => activeWorksheet,
-              getItem: (name: string) => {
-                if (name !== '2025 Starting Balances') {
-                  throw new Error("The requested resource doesn't exist.");
-                }
-                return activeWorksheet;
-              },
+              getActiveWorksheet: () => worksheets[0],
             },
           },
-        };
-        return cb(ctx);
-      },
+        }),
     };
+    return { worksheets, written };
+  }
 
-    await applyOps([
-      {
-        kind: 'write_range',
-        range: 'Sheet1!A1:B2',
-        cells: [
-          [{ value: 'Cash' }, { value: 'Raw Materials' }],
-          [{ value: 401900 }, { value: 419500 }],
-        ],
-        reason: 'List 2025 starting balances horizontally',
-      },
-    ]);
+  const writeOp = (range: string) =>
+    ({ kind: 'write_range', range, cells: [[{ value: 999 }]], reason: 'test' }) as const;
 
-    expect(activeWorksheet.getRange).toHaveBeenCalledWith('A1:B2');
-    expect(writtenFormulas).toEqual([
-      ['Cash', 'Raw Materials'],
-      [401900, 419500],
-    ]);
+  it('rejects a write to a missing sheet instead of redirecting it to the active sheet', async () => {
+    const { applyOps, readRange } = await import('../src/officeBridge.js');
+    const { worksheets, written } = installExcel(['Payroll']);
 
-    const readBack = await readRange('Sheet1!A1:B2');
-    expect(readBack[0]?.[0]?.value).toBe('Cash');
-    expect(readBack[1]?.[0]?.value).toBe(401900);
+    await expect(applyOps([writeOp('MissingSheet!A1')])).rejects.toThrow('No such sheet: MissingSheet');
+    await expect(readRange('Sheet1!A1')).rejects.toThrow('No such sheet: Sheet1');
+    await expect(applyOps([{ kind: 'delete_sheet', name: 'Gone', reason: 'x' }])).rejects.toThrow(
+      'No such sheet: Gone',
+    );
+    expect(worksheets[0]!.getRange).not.toHaveBeenCalled();
+    expect(written.size).toBe(0);
+  });
+
+  it('rejects unqualified references and adding a sheet that already exists', async () => {
+    const { applyOps } = await import('../src/officeBridge.js');
+    installExcel(['Payroll']);
+
+    await expect(applyOps([writeOp('A1')])).rejects.toThrow('Reference is missing a sheet name');
+    await expect(applyOps([{ kind: 'add_sheet', name: 'payroll', reason: 'x' }])).rejects.toThrow(
+      'Sheet already exists: Payroll',
+    );
+  });
+
+  it('matches sheet names case-insensitively and writes to exactly that sheet', async () => {
+    const { applyOps } = await import('../src/officeBridge.js');
+    const { written } = installExcel(['Payroll', '2025 Report']);
+
+    await applyOps([writeOp("'2025 report'!A1")]);
+    expect([...written.keys()]).toEqual(['2025 Report!A1']);
   });
 });

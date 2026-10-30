@@ -70,6 +70,11 @@ export interface ChangeSet {
   createdAt: string;
   status: ChangeSetStatus;
   ops: ChangeOp[];
+  /**
+   * Pre-existing worksheets the ops target, resolved once at staging. Apply
+   * refuses to run if any of them has since been deleted or renamed.
+   */
+  targets: SheetTarget[];
   /** Snapshot of affected ranges taken just before apply, for undo. */
   snapshots?: RangeSnapshot[];
   /**
@@ -78,6 +83,12 @@ export interface ChangeSet {
    * but whose side effects may not be perfectly reversible.
    */
   undoFidelity: 'full' | 'partial';
+}
+
+export interface SheetTarget {
+  id: string;
+  /** Exact worksheet name when the change-set was staged. */
+  name: string;
 }
 
 export interface RangeSnapshot {

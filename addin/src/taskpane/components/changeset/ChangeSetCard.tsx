@@ -19,6 +19,7 @@ export function ChangeSetCard({
   onUndo,
 }: ChangeSetCardProps): JSX.Element {
   const n = preview.length;
+  const sheets = targetSheets(preview);
   return (
     <div className={`cs ${status}`}>
       <div className="cs-head">
@@ -49,6 +50,11 @@ export function ChangeSetCard({
           )}
         </span>
       </div>
+      {sheets.length > 0 && (
+        <div className="cs-sheet">
+          {sheets.length === 1 ? 'Sheet' : 'Sheets'}: {sheets.join(', ')}
+        </div>
+      )}
       <div className="cs-ops">
         {preview.map((p, i) => (
           <DiffInspector key={i} item={p} />
@@ -56,6 +62,26 @@ export function ChangeSetCard({
       </div>
     </div>
   );
+}
+
+/** Distinct sheets the ops touch, as resolved at staging (exact names). */
+function targetSheets(preview: ChangePreviewItem[]): string[] {
+  const names = preview.map(({ op }) => {
+    switch (op.kind) {
+      case 'write_range':
+      case 'clear_range':
+      case 'format_range':
+      case 'sort_range':
+        return op.range.slice(0, op.range.lastIndexOf('!')).replace(/^'|'$/g, '');
+      case 'add_sheet':
+      case 'rename_sheet':
+      case 'delete_sheet':
+        return op.name;
+      default:
+        return op.sheet;
+    }
+  });
+  return [...new Set(names.filter((name) => name.length > 0))];
 }
 
 export function OpRow({ item }: { item: ChangePreviewItem }): JSX.Element {
