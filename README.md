@@ -174,7 +174,7 @@ Use the table below to tune **LM Studio**, **Ollama**, or **Embedded GGUF** for 
 
 ### 🗄️ Model Context Protocol (MCP) Connectors
 * Go to **Settings** $\rightarrow$ **MCP Connectors**.
-* Add trusted directories under **Explicit User-Approved Paths** (e.g. `C:\Users\User\Documents\Data`).
+* Add trusted directories under **Explicit User-Approved Paths** (e.g. `C:\Users\User\Documents\Data`). These folders are also the only places the agent's file import may read from; to import a file outside them, attach it in chat instead.
 * Configure connectors:
   * **SQLite Database:** Query local SQLite tables in read-only mode or stage table rows directly into a new sheet.
   * **CSV Directory:** Search, preview, and stage local CSV/TSV collections into worksheets.

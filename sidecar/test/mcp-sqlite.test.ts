@@ -5,6 +5,13 @@ import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync } from 'node:fs';
 import { SqliteConnector } from '../src/mcp/connectors/sqliteConnector.js';
 import { McpSecurityError } from '../src/mcp/pathGuard.js';
+import { openDb } from '../src/db.js';
+import { startServer } from '../src/server.js';
+
+const ROWS_1500 = 'WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1500)';
+// About six seconds of single-step work: long enough that a blocked event loop is unmistakable.
+const SLOW_QUERY =
+  'WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<60000000) SELECT count(*) AS c FROM n';
 
 describe('SqliteConnector', () => {
   let tempDir: string;
@@ -184,5 +191,87 @@ describe('SqliteConnector', () => {
       const maliciousName = op.cells[3][1];
       expect(maliciousName).toEqual({ value: "'=cmd|' /C calc'!A0" });
     }
+  });
+
+  describe('bounded work (F10)', () => {
+    const open = (options: Record<string, unknown> = {}): SqliteConnector =>
+      (connector = new SqliteConnector({
+        id: 'sqlite-1',
+        name: 'Sales DB',
+        enabled: true,
+        transport: 'builtin',
+        type: 'sqlite',
+        allowedPaths: [tempDir],
+        options: { dbPath, ...options },
+      }));
+    const rowsOf = (res: { content: { text: string }[] }): { rowCount: number; truncated: boolean } =>
+      JSON.parse(res.content[0]!.text);
+
+    it.each([
+      ['an explicit larger LIMIT', `${ROWS_1500} SELECT x FROM n LIMIT 1500`],
+      ['LIMIT -1', `${ROWS_1500} SELECT x FROM n LIMIT -1`],
+      ['a LIMIT inside a comment', `${ROWS_1500} SELECT x FROM n -- limit`],
+      ['a LIMIT inside a string literal', `${ROWS_1500} SELECT x, 'limit' AS l FROM n`],
+      ['a nested LIMIT', `${ROWS_1500} SELECT x FROM (SELECT x FROM n LIMIT 1500)`],
+    ])('caps rows at the requested limit despite %s', async (_label, query) => {
+      const res = await open().callTool('sqlite_read_query', { query, limit: 1 });
+      expect(res.isError).toBeFalsy();
+      expect(rowsOf(res)).toMatchObject({ rowCount: 1, truncated: true });
+    });
+
+    it('caps staged rows at 1000 whatever the SQL says', async () => {
+      const res = await open().callTool('sqlite_stage_table_to_sheet', {
+        queryOrTable: `${ROWS_1500} SELECT x FROM n LIMIT 1500`,
+        hasHeaders: true,
+      });
+      expect(res.isError).toBeFalsy();
+      const op = res.changeOps?.[0];
+      expect(op?.kind === 'write_range' && op.cells.length).toBe(1001);
+      expect(JSON.parse(res.content[0]!.text)).toMatchObject({ rowCount: 1000, truncated: true });
+    });
+
+    it('keeps /api/health responsive during a slow query and stops it on abort', async () => {
+      const sidecar = await startServer({ db: openDb(':memory:'), port: 0 });
+      try {
+        const controller = new AbortController();
+        const pending = open().callTool('sqlite_read_query', { query: SLOW_QUERY }, {
+          abortSignal: controller.signal,
+        });
+        const settled = pending.then(
+          () => 'resolved',
+          (e: Error) => e.message,
+        );
+        await new Promise((r) => setTimeout(r, 300));
+
+        const t0 = Date.now();
+        const health = await fetch(`http://127.0.0.1:${sidecar.port}/api/health`);
+        expect(health.status).toBe(200);
+        expect(Date.now() - t0).toBeLessThan(1_000);
+
+        const t1 = Date.now();
+        controller.abort();
+        expect(await settled).toMatch(/stopped/i);
+        expect(Date.now() - t1).toBeLessThan(1_000);
+      } finally {
+        await sidecar.close();
+      }
+    });
+
+    it('stops a query that exceeds its execution budget', async () => {
+      const t0 = Date.now();
+      await expect(
+        open({ queryTimeoutMs: 500 }).callTool('sqlite_read_query', { query: SLOW_QUERY }),
+      ).rejects.toThrow(/execution budget/);
+      expect(Date.now() - t0).toBeLessThan(3_000);
+    });
+
+    it('rejects malformed limits instead of coercing them', async () => {
+      const c = open();
+      await expect(c.callTool('sqlite_read_query', { query: 'SELECT 1', limit: 'invalid' })).rejects.toThrow(
+        /limit/,
+      );
+      await expect(c.callTool('sqlite_read_query', { query: 'SELECT 1', limit: 5000 })).rejects.toThrow(/limit/);
+      await expect(c.callTool('sqlite_read_query', { query: 'SELECT 1', limit: 2.5 })).rejects.toThrow(/limit/);
+    });
   });
 });

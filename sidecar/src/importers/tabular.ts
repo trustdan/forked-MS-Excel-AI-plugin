@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { extname, isAbsolute, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { extname } from 'node:path';
 import {
   colToIndex,
   formatA1,
@@ -8,6 +8,8 @@ import {
   type CellScalar,
   type ChangeOp,
 } from '@excelai/shared';
+import { readFileCapped } from '../boundedRead.js';
+import { PathGuard } from '../mcp/pathGuard.js';
 
 export const MAX_IMPORT_BYTES = 10 * 1024 * 1024; // 10MB
 export const MAX_IMPORT_CELLS = 50_000;
@@ -252,27 +254,20 @@ export function parseTabularContent(
 }
 
 /**
- * Read and parse local file with strict security and memory bounds.
+ * Read and parse local file with strict security and memory bounds. Only paths
+ * inside `approvedPaths` (the user's approved folders) are ever opened.
  */
 export function loadAndParseLocalFile(
   filePath: string,
+  approvedPaths: readonly string[],
   options?: { maxBytes?: number; maxCells?: number },
 ): { rows: CellScalar[][]; format: string; totalRows: number; totalCols: number } {
   const maxBytes = options?.maxBytes ?? MAX_IMPORT_BYTES;
   const maxCells = options?.maxCells ?? MAX_IMPORT_CELLS;
 
-  const resolved = resolve(filePath);
+  const resolved = PathGuard.assertApproved(filePath, [...approvedPaths], 'import');
   if (!existsSync(resolved)) {
     throw new Error(`File not found: "${filePath}"`);
-  }
-
-  const stat = statSync(resolved);
-  if (!stat.isFile()) {
-    throw new Error(`Path is not a regular file: "${filePath}"`);
-  }
-
-  if (stat.size > maxBytes) {
-    throw new Error(`File size (${Math.round(stat.size / 1024)} KB) exceeds limit of ${Math.round(maxBytes / 1024)} KB.`);
   }
 
   const ext = extname(resolved).toLowerCase();
@@ -282,13 +277,18 @@ export function loadAndParseLocalFile(
     );
   }
 
+  const { bytes, size, truncated } = readFileCapped(resolved, maxBytes);
+  if (truncated) {
+    throw new Error(`File size (${Math.round(size / 1024)} KB) exceeds limit of ${Math.round(maxBytes / 1024)} KB.`);
+  }
+
   let format: 'csv' | 'tsv' | 'markdown' | 'json' | 'auto' = 'auto';
   if (ext === '.tsv') format = 'tsv';
   else if (ext === '.json') format = 'json';
   else if (ext === '.md' || ext === '.markdown') format = 'markdown';
   else if (ext === '.csv') format = 'csv';
 
-  const content = readFileSync(resolved, 'utf-8');
+  const content = bytes.toString('utf-8');
   const rows = parseTabularContent(content, format);
 
   const totalRows = rows.length;

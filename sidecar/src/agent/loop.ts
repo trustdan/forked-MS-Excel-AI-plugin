@@ -28,6 +28,7 @@ import {
   parseTabularContent,
 } from '../importers/tabular.js';
 import type { McpManager } from '../mcp/manager.js';
+import { PathGuard } from '../mcp/pathGuard.js';
 
 export type AgentEvent =
   | { kind: 'thinking_delta'; text: string }
@@ -56,6 +57,8 @@ export interface AgentTurnOptions {
   maxIterations?: number;
   abortSignal?: AbortSignal;
   mcpManager?: McpManager;
+  /** Folders the user approved; import_local_data may only open files inside them. */
+  approvedPaths?: readonly string[];
 }
 
 export interface AgentTurnResult {
@@ -413,6 +416,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
           pendingOps,
           emit,
           flaggedFormulas,
+          options.approvedPaths ?? [],
           options.mcpManager,
           abortSignal,
           (normalizedArgsJson, writeStartKey) => {
@@ -505,6 +509,7 @@ async function executeToolCall(
   pendingOps: ChangeOp[],
   onEvent: (ev: AgentEvent) => void,
   flaggedFormulas: Map<string, string>,
+  approvedPaths: readonly string[],
   mcpManager?: McpManager,
   abortSignal?: AbortSignal,
   onArgsNormalized?: (normalizedArgsJson: string, writeStartKey?: string) => void,
@@ -604,8 +609,9 @@ async function executeToolCall(
           targetSheet = map.sheets[0]?.name ?? 'Sheet1';
         }
 
-        const resolvedDiskPath = resolve(filePath);
-        if (!existsSync(resolvedDiskPath)) {
+        // Attached content needs no filesystem access; a path on disk must sit in an approved folder.
+        const approved = PathGuard.isApproved(filePath, [...approvedPaths]);
+        if (!approved || !existsSync(resolve(filePath))) {
           const attached = findAttachedDocument(messages, filePath);
           if (attached) {
             const ext = extname(attached.name).toLowerCase();
@@ -661,12 +667,17 @@ async function executeToolCall(
             });
           }
 
+          if (!approved) {
+            return errorResult(
+              `"${filePath}" is not in a folder you have approved for import, so it was not read. If the user attached the document in chat, its contents are already in the user message under [Attached Document: ...] — use write_range directly. Otherwise ask the user to attach the file or approve its folder in Settings; do not retry with guessed paths.`,
+            );
+          }
           return errorResult(
             `File not found on local disk: "${filePath}". Do not guess directory paths (such as /mnt/data/) or retry import_local_data with guessed paths. If the user attached a document in chat, its full contents are already in the user message under [Attached Document: ...] — use write_range directly.`,
           );
         }
 
-        const { rows, totalRows, totalCols, format } = loadAndParseLocalFile(filePath);
+        const { rows, totalRows, totalCols, format } = loadAndParseLocalFile(filePath, approvedPaths);
         const ops = generateImportChangeOps({
           rows,
           targetSheet,

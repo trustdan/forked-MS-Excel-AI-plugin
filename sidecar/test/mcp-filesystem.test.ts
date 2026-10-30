@@ -140,4 +140,67 @@ describe('FilesystemConnector', () => {
       connector.callTool('fs_read_file', { path: '../outside.txt' }),
     ).rejects.toThrow(McpSecurityError);
   });
+
+  describe('argument validation and read caps (F11, C4)', () => {
+    const open = (): FilesystemConnector =>
+      (connector = new FilesystemConnector({
+        id: 'fs-1',
+        name: 'Local Workspace',
+        enabled: true,
+        transport: 'builtin',
+        type: 'filesystem',
+        allowedPaths: [rootDir],
+        options: { rootPath: rootDir },
+      }));
+
+    beforeEach(() => {
+      writeFileSync(join(rootDir, 'large.txt'), 'x'.repeat(300 * 1024));
+    });
+
+    it.each([['invalid'], [Number.NaN], [-5], [0], [1.5], [262_145], [null]])(
+      'rejects maxBytes %s instead of coercing it',
+      async (maxBytes) => {
+        await expect(open().callTool('fs_read_file', { path: 'large.txt', maxBytes })).rejects.toThrow(/maxBytes/);
+      },
+    );
+
+    it('rejects unknown arguments and wrong types', async () => {
+      const c = open();
+      await expect(c.callTool('fs_read_file', { path: 'large.txt', extra: 1 })).rejects.toThrow(/extra/);
+      await expect(c.callTool('fs_read_file', { path: 42 })).rejects.toThrow(/path/);
+      await expect(c.callTool('fs_search_files', { query: 'x', maxResults: 'all' })).rejects.toThrow(/maxResults/);
+    });
+
+    it('respects the requested and the absolute byte caps', async () => {
+      const c = open();
+      const parse = (res: { content: { text: string }[] }) => JSON.parse(res.content[0]!.text);
+
+      expect(parse(await c.callTool('fs_read_file', { path: 'large.txt', maxBytes: 10 }))).toMatchObject({
+        bytesRead: 10,
+        truncated: true,
+      });
+      expect(parse(await c.callTool('fs_read_file', { path: 'large.txt' }))).toMatchObject({
+        bytesRead: 64 * 1024,
+        truncated: true,
+      });
+      expect(parse(await c.callTool('fs_read_file', { path: 'large.txt', maxBytes: 262_144 }))).toMatchObject({
+        sizeBytes: 300 * 1024,
+        bytesRead: 262_144,
+        truncated: true,
+      });
+      expect(parse(await c.callTool('fs_read_file', { path: 'readme.txt', maxBytes: 262_144 }))).toMatchObject({
+        bytesRead: 26,
+        truncated: false,
+      });
+    });
+
+    it('advertises the same bounds it enforces', async () => {
+      const read = (await open().listTools()).find((t) => t.name === 'fs_read_file')!;
+      expect(read.inputSchema).toMatchObject({
+        properties: { maxBytes: { type: 'integer', minimum: 1, maximum: 262_144 } },
+        required: ['path'],
+        additionalProperties: false,
+      });
+    });
+  });
 });

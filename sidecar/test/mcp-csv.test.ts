@@ -164,4 +164,23 @@ describe('CsvDirectoryConnector', () => {
       }),
     ).rejects.toThrow(McpSecurityError);
   });
+
+  it('rejects malformed numeric arguments instead of coercing them (F11)', async () => {
+    connector = new CsvDirectoryConnector({
+      id: 'csv-1',
+      name: 'CSV Data',
+      enabled: true,
+      transport: 'builtin',
+      type: 'csv-directory',
+      allowedPaths: [csvDir],
+      options: { dirPath: csvDir },
+    });
+
+    await expect(
+      connector.callTool('csv_read_preview', { relativePath: 'employees.csv', maxRows: 'invalid' }),
+    ).rejects.toThrow(/maxRows/);
+    await expect(
+      connector.callTool('csv_query', { relativePath: 'employees.csv', limit: 10_000 }),
+    ).rejects.toThrow(/limit/);
+  });
 });

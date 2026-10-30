@@ -61,6 +61,7 @@ describe('import_local_data tool integration', () => {
       workbookName: 'Sales.xlsx',
       history: [],
       userMessage: 'Import sales.csv into Sheet1',
+      approvedPaths: [tempDir],
       onEvent: (ev) => events.push(ev),
     });
 
@@ -108,7 +109,12 @@ describe('import_local_data tool integration', () => {
       'content-type': 'application/json',
     };
 
-    // Test 1: parse local CSV file
+    // Test 1: parse local CSV file from an approved folder
+    await fetch(`${base}/api/mcp/paths`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ path: tempDir }),
+    });
     const sampleCsv = join(tempDir, 'metrics.csv');
     writeFileSync(sampleCsv, 'Metric,Value\nCPU,45.2\nMemory,78.1');
 
@@ -211,5 +217,105 @@ describe('import_local_data tool integration', () => {
       'alreadyInContext',
     );
     expect(result.stagedChangeSetId).toBeDefined();
+  });
+
+  it('refuses a model-supplied path outside approved folders without reading it (F9)', async () => {
+    const privateFile = join(tempDir, 'private.csv');
+    writeFileSync(privateFile, 'Secret\nPRIVATE-MARKER-7f3a');
+
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'import_local_data',
+            args: { filePath: privateFile, reason: 'Import private data' },
+          },
+        ],
+      },
+      { text: 'Could not import.' },
+    ]);
+
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book.xlsx',
+      history: [],
+      userMessage: 'Import my data',
+      approvedPaths: [],
+      onEvent: () => {},
+    });
+
+    expect(result.stagedChangeSetId).toBeUndefined();
+    const toolReply = provider.requests.at(1)?.messages.findLast((m) => m.role === 'tool');
+    const replyText = toolReply && 'content' in toolReply ? toolReply.content : '';
+    expect(replyText).toMatch(/not in a folder you have approved/);
+    expect(JSON.stringify(provider.requests)).not.toContain('PRIVATE-MARKER-7f3a');
+  });
+
+  it('gives the same refusal for a missing and an existing unapproved path (F9)', async () => {
+    const existing = join(tempDir, 'exists.csv');
+    writeFileSync(existing, 'A\n1');
+    const replies: string[] = [];
+    for (const filePath of [existing, join(tempDir, 'missing.csv')]) {
+      const wb = new WorkbookEmulator(['Sheet1']);
+      const provider = new ScriptedProvider([
+        { toolCalls: [{ name: 'import_local_data', args: { filePath, reason: 'Import' } }] },
+        { text: 'done' },
+      ]);
+      await runAgentTurn({
+        provider,
+        executor: wb,
+        changeSets: new ChangeSetManager(wb, 'wb-test'),
+        workbookName: 'Book.xlsx',
+        history: [],
+        userMessage: 'Import',
+        onEvent: () => {},
+      });
+      const reply = provider.requests.at(1)?.messages.findLast((m) => m.role === 'tool');
+      const escapedPath = JSON.stringify(filePath).slice(1, -1);
+      replies.push((reply && 'content' in reply ? reply.content : '').replaceAll(escapedPath, '<path>'));
+    }
+    expect(replies[0]).toBe(replies[1]);
+  });
+
+  it('applies the approved-folder rule to /api/importer/parse file paths (F9)', async () => {
+    sidecar = await startServer({ db: openDb(':memory:'), port: 0 });
+    const base = `http://127.0.0.1:${sidecar.port}`;
+    const pairRes = await fetch(`${base}/api/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: sidecar.auth.currentPairingCode! }),
+    });
+    const { token } = (await pairRes.json()) as { token: string };
+    const authHeaders = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+
+    const privateFile = join(tempDir, 'private.csv');
+    writeFileSync(privateFile, 'Secret\nPRIVATE-MARKER-7f3a');
+
+    const denied = await fetch(`${base}/api/importer/parse`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ filePath: privateFile }),
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.text()).not.toContain('PRIVATE-MARKER-7f3a');
+
+    const approve = await fetch(`${base}/api/mcp/paths`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ path: tempDir }),
+    });
+    expect(approve.status).toBe(200);
+
+    const allowed = await fetch(`${base}/api/importer/parse`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ filePath: privateFile }),
+    });
+    expect(allowed.status).toBe(200);
+    expect(((await allowed.json()) as { headers: string[] }).headers).toEqual(['Secret']);
   });
 });

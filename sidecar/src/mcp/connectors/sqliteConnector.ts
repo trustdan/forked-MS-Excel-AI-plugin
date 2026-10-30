@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { z } from 'zod';
 import { existsSync } from 'node:fs';
 import type {
   ChangeOp,
@@ -10,6 +11,58 @@ import type {
 import { indexToCol, parseA1, formatA1 } from '@excelai/shared';
 import { PathGuard, McpSecurityError } from '../pathGuard.js';
 import type { McpClient } from '../types.js';
+import { parseArgs, toolDefinitions } from '../builtinTools.js';
+import { DEFAULT_QUERY_TIMEOUT_MS, runBoundedQuery } from './sqliteQuery.js';
+
+const MAX_QUERY_ROWS = 1000;
+
+const TOOLS = {
+  sqlite_list_tables: {
+    description: 'List all user tables and views in the connected SQLite database with column counts.',
+    parameters: z.object({}).strict(),
+  },
+  sqlite_describe_table: {
+    description: 'Describe the schema of a table or view (columns, data types, primary keys, nullability).',
+    parameters: z
+      .object({
+        table: z.string().trim().min(1).describe('The table or view name to inspect'),
+      })
+      .strict(),
+  },
+  sqlite_read_query: {
+    description:
+      'Execute a read-only SQL query (SELECT / WITH / EXPLAIN) against the SQLite database. Mutation queries are strictly forbidden. At most `limit` rows are returned whatever the SQL says; `truncated` reports whether more existed.',
+    parameters: z
+      .object({
+        query: z
+          .string()
+          .trim()
+          .min(1)
+          .describe('Read-only SQL statement (e.g. "SELECT * FROM orders WHERE total > 100")'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_QUERY_ROWS)
+          .optional()
+          .describe('Maximum rows to return (default 500, max 1000)'),
+      })
+      .strict(),
+  },
+  sqlite_stage_table_to_sheet: {
+    description:
+      'Execute a read-only query or select a full table and stage the resulting rows (at most 1000) directly into an Excel worksheet change-set for user review.',
+    parameters: z
+      .object({
+        queryOrTable: z.string().trim().min(1).describe('A table name or a SELECT statement'),
+        targetSheet: z.string().optional().describe('Sheet name to populate (defaults to "Sheet1")'),
+        startCell: z.string().optional().describe('Top-left cell address (defaults to "A1")'),
+        hasHeaders: z.boolean().optional().describe('Whether to include column headers in row 1 (defaults to true)'),
+        reason: z.string().max(300).optional().describe('One-line justification for staging this data'),
+      })
+      .strict(),
+  },
+};
 
 const DISALLOWED_SQL_PATTERNS = [
   /\b(insert|update|delete|drop|alter|create|replace|truncate|vacuum|attach|detach)\b/i,
@@ -58,116 +111,48 @@ export class SqliteConnector implements McpClient {
   }
 
   async listTools(): Promise<McpToolDefinition[]> {
-    return [
-      {
-        name: 'sqlite_list_tables',
-        description: 'List all user tables and views in the connected SQLite database with column counts.',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'sqlite_describe_table',
-        description: 'Describe the schema of a table or view (columns, data types, primary keys, nullability).',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            table: {
-              type: 'string',
-              description: 'The table or view name to inspect',
-            },
-          },
-          required: ['table'],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'sqlite_read_query',
-        description:
-          'Execute a read-only SQL query (SELECT / WITH / EXPLAIN) against the SQLite database. Mutation queries are strictly forbidden.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            query: {
-              type: 'string',
-              description: 'Read-only SQL statement (e.g. "SELECT * FROM orders WHERE total > 100 LIMIT 50")',
-            },
-            limit: {
-              type: 'number',
-              description: 'Maximum rows to return (default 500, max 1000)',
-            },
-          },
-          required: ['query'],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: 'sqlite_stage_table_to_sheet',
-        description:
-          'Execute a read-only query or select a full table and stage the resulting rows directly into an Excel worksheet change-set for user review.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            queryOrTable: {
-              type: 'string',
-              description: 'A table name or a SELECT statement',
-            },
-            targetSheet: {
-              type: 'string',
-              description: 'Sheet name to populate (defaults to "Sheet1")',
-            },
-            startCell: {
-              type: 'string',
-              description: 'Top-left cell address (defaults to "A1")',
-            },
-            hasHeaders: {
-              type: 'boolean',
-              description: 'Whether to include column headers in row 1 (defaults to true)',
-            },
-            reason: {
-              type: 'string',
-              description: 'One-line justification for staging this data',
-            },
-          },
-          required: ['queryOrTable'],
-          additionalProperties: false,
-        },
-      },
-    ];
+    return toolDefinitions(TOOLS);
   }
 
   async callTool(
     toolName: string,
     args: Record<string, unknown>,
-    _options?: { abortSignal?: AbortSignal },
+    options?: { abortSignal?: AbortSignal },
   ): Promise<McpToolResult> {
     if (!this.db) {
       await this.initialize();
     }
     const db = this.db!;
+    // Anything that scans user data runs out of process under a time budget; schema lookups stay here.
+    const query = (sql: string, maxRows: number) =>
+      runBoundedQuery({
+        dbPath: this.dbPath!,
+        sql,
+        maxRows,
+        timeoutMs: this.queryTimeoutMs(),
+        abortSignal: options?.abortSignal,
+      });
 
     switch (toolName) {
       case 'sqlite_list_tables': {
+        parseArgs(TOOLS.sqlite_list_tables, args);
         const stmt = db.prepare(
           "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name ASC;",
         );
         const rows = stmt.all() as Array<{ name: string; type: string }>;
-        const tablesWithCounts = rows.map((r) => {
-          let count = 0;
-          try {
-            // Count rows if it's a table
-            if (r.type === 'table') {
-              const countStmt = db.prepare(`SELECT count(*) as c FROM "${r.name.replace(/"/g, '""')}";`);
-              const res = countStmt.get() as { c: number } | undefined;
-              count = res?.c ?? 0;
-            }
-          } catch {
-            // view or error
-          }
-          return { name: r.name, type: r.type, rowCount: count };
-        });
+        const tables = rows.filter((r) => r.type === 'table');
+        const counts = new Map<string, number>();
+        if (tables.length > 0) {
+          const countSql = tables
+            .map(
+              (t) =>
+                `SELECT '${t.name.replace(/'/g, "''")}' AS name, count(*) AS c FROM "${t.name.replace(/"/g, '""')}"`,
+            )
+            .join(' UNION ALL ');
+          const res = await query(countSql, tables.length);
+          for (const r of res.rows) counts.set(String(r.name), Number(r.c));
+        }
+        const tablesWithCounts = rows.map((r) => ({ name: r.name, type: r.type, rowCount: counts.get(r.name) ?? 0 }));
         return {
           content: [
             {
@@ -179,10 +164,7 @@ export class SqliteConnector implements McpClient {
       }
 
       case 'sqlite_describe_table': {
-        const tableName = String(args.table ?? '').trim();
-        if (!tableName) {
-          return { content: [{ type: 'text', text: 'Error: table name is required' }], isError: true };
-        }
+        const tableName = parseArgs(TOOLS.sqlite_describe_table, args).table;
         // Validate table name contains no injection chars
         if (!/^[a-zA-Z0-9_ -]+$/.test(tableName)) {
           return {
@@ -221,17 +203,10 @@ export class SqliteConnector implements McpClient {
       }
 
       case 'sqlite_read_query': {
-        const query = String(args.query ?? '').trim();
-        const limit = Math.min(Math.max(1, Number(args.limit ?? 500)), 1000);
-        this.assertReadOnlyQuery(query);
+        const { query: sql, limit = 500 } = parseArgs(TOOLS.sqlite_read_query, args);
+        this.assertReadOnlyQuery(sql);
 
-        let finalQuery = query;
-        if (!/\blimit\b/i.test(finalQuery)) {
-          finalQuery = `${finalQuery} LIMIT ${limit}`;
-        }
-
-        const stmt = db.prepare(finalQuery);
-        const rows = stmt.all() as Record<string, unknown>[];
+        const { rows, truncated } = await query(sql, limit);
         return {
           content: [
             {
@@ -239,6 +214,7 @@ export class SqliteConnector implements McpClient {
               text: JSON.stringify({
                 ok: true,
                 rowCount: rows.length,
+                truncated,
                 columns: rows.length > 0 && rows[0] ? Object.keys(rows[0]) : [],
                 rows,
               }),
@@ -248,14 +224,15 @@ export class SqliteConnector implements McpClient {
       }
 
       case 'sqlite_stage_table_to_sheet': {
-        const rawTarget = String(args.queryOrTable ?? '').trim();
-        const targetSheet = String(args.targetSheet ?? 'Sheet1').trim();
-        const startCell = String(args.startCell ?? 'A1').trim();
-        const hasHeaders = args.hasHeaders !== false;
-        const reason = String(args.reason ?? `Import SQLite data: ${rawTarget.slice(0, 50)}`);
+        const staged = parseArgs(TOOLS.sqlite_stage_table_to_sheet, args);
+        const rawTarget = staged.queryOrTable;
+        const targetSheet = (staged.targetSheet ?? 'Sheet1').trim();
+        const startCell = (staged.startCell ?? 'A1').trim();
+        const hasHeaders = staged.hasHeaders !== false;
+        const reason = staged.reason || `Import SQLite data: ${rawTarget.slice(0, 50)}`;
 
-        let query = rawTarget;
-        if (!/\bselect\b/i.test(query)) {
+        let sql = rawTarget;
+        if (!/\bselect\b/i.test(sql)) {
           // Treat as table name
           if (!/^[a-zA-Z0-9_ -]+$/.test(rawTarget)) {
             return {
@@ -263,16 +240,12 @@ export class SqliteConnector implements McpClient {
               isError: true,
             };
           }
-          query = `SELECT * FROM "${rawTarget.replace(/"/g, '""')}" LIMIT 1000;`;
+          sql = `SELECT * FROM "${rawTarget.replace(/"/g, '""')}"`;
         } else {
-          this.assertReadOnlyQuery(query);
-          if (!/\blimit\b/i.test(query)) {
-            query = `${query} LIMIT 1000`;
-          }
+          this.assertReadOnlyQuery(sql);
         }
 
-        const stmt = db.prepare(query);
-        const rows = stmt.all() as Record<string, unknown>[];
+        const { rows, truncated } = await query(sql, MAX_QUERY_ROWS);
         if (rows.length === 0 || !rows[0]) {
           return {
             content: [{ type: 'text', text: JSON.stringify({ ok: true, note: 'Query returned 0 rows. No cells staged.' }) }],
@@ -335,8 +308,11 @@ export class SqliteConnector implements McpClient {
                 staged: true,
                 targetRange,
                 rowCount: rows.length,
+                truncated,
                 columnCount: columns.length,
-                note: `Staged ${rows.length} rows into ${targetRange}. Awaiting user review and approval.`,
+                note: truncated
+                  ? `Staged the first ${rows.length} rows into ${targetRange}; the query had more. Awaiting user review and approval.`
+                  : `Staged ${rows.length} rows into ${targetRange}. Awaiting user review and approval.`,
               }),
             },
           ],
@@ -350,6 +326,13 @@ export class SqliteConnector implements McpClient {
           isError: true,
         };
     }
+  }
+
+  private queryTimeoutMs(): number {
+    const configured = this.config.options?.queryTimeoutMs;
+    return typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+      ? configured
+      : DEFAULT_QUERY_TIMEOUT_MS;
   }
 
   private assertReadOnlyQuery(query: string): void {
