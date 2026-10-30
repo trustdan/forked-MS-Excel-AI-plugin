@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AnthropicProvider } from '../src/providers/anthropic.js';
+import { describe, expect, it } from 'vitest';
+import type { GuardedRequestInit, Transport } from '../src/networkGuard.js';
+import { AnthropicProvider, anthropicUrl } from '../src/providers/anthropic.js';
 import { OpenAIProvider } from '../src/providers/openai.js';
 import {
   detectReasoningRumination,
@@ -11,13 +12,11 @@ import {
 } from '../src/providers/index.js';
 import { ProviderError, type ChatDelta } from '../src/providers/types.js';
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
+let transport: Transport = () => Promise.reject(new Error('no transport stubbed'));
 
-function stubFetch(handler: (url: string, init: RequestInit) => { status: number; body: unknown }) {
+function stubFetch(handler: (url: string, init: GuardedRequestInit) => { status: number; body: unknown }) {
   const calls: { url: string; body: unknown }[] = [];
-  vi.stubGlobal('fetch', async (url: string | URL, init?: RequestInit) => {
+  transport = (async (url: string | URL, init?: GuardedRequestInit) => {
     const parsedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
     calls.push({ url: String(url), body: parsedBody });
     const res = handler(String(url), init ?? {});
@@ -43,7 +42,7 @@ describe('Anthropic adapter', () => {
       },
     }));
 
-    const p = new AnthropicProvider('claude-test', 'sk-test');
+    const p = new AnthropicProvider('claude-test', 'sk-test', undefined, transport);
     const res = await p.chat({
       messages: [
         { role: 'system', content: 'sys' },
@@ -61,16 +60,28 @@ describe('Anthropic adapter', () => {
     const sent = calls[0]!.body as Record<string, unknown>;
     expect(sent.system).toBe('sys');
     expect((sent.tools as unknown[])[0]).toMatchObject({ name: 'read_range' });
-    expect(calls[0]!.url).toContain('/v1/messages');
+    expect(calls[0]!.url).toBe('http://127.0.0.1:1234/v1/messages');
   });
 
   it('throws a retryable ProviderError on 429/5xx', async () => {
     stubFetch(() => ({ status: 429, body: { error: 'rate limited' } }));
-    const p = new AnthropicProvider('claude-test', 'sk-test');
+    const p = new AnthropicProvider('claude-test', 'sk-test', undefined, transport);
     await expect(p.chat({ messages: [{ role: 'user', content: 'x' }] })).rejects.toMatchObject({
       retryable: true,
       status: 429,
     });
+  });
+
+  it('builds /v1/messages exactly once whether or not the base URL ends in /v1', async () => {
+    const calls = stubFetch(() => ({
+      status: 200,
+      body: { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' },
+    }));
+    for (const base of ['http://127.0.0.1:1234/v1', 'http://127.0.0.1:1234/v1/', 'http://127.0.0.1:1234']) {
+      await new AnthropicProvider('m', 'k', base, transport).chat({ messages: [{ role: 'user', content: 'x' }] });
+    }
+    expect(calls.map((c) => c.url)).toEqual(Array(3).fill('http://127.0.0.1:1234/v1/messages'));
+    expect(anthropicUrl('http://localhost:8080/proxy', 'models')).toBe('http://localhost:8080/proxy/v1/models');
   });
 });
 
@@ -94,7 +105,7 @@ describe('OpenAI / OpenAI-compatible adapter', () => {
       },
     }));
 
-    const p = new OpenAIProvider('llama3', undefined, 'http://localhost:11434/v1', 'openai-compatible');
+    const p = new OpenAIProvider('llama3', undefined, 'http://localhost:11434/v1', 'openai-compatible', transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'x' }] });
 
     expect(calls[0]!.url).toBe('http://localhost:11434/v1/chat/completions');
@@ -107,7 +118,7 @@ describe('OpenAI / OpenAI-compatible adapter', () => {
       status: 200,
       body: { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] },
     }));
-    const p = new OpenAIProvider('gpt-test', 'key');
+    const p = new OpenAIProvider('gpt-test', 'key', undefined, undefined, transport);
     await p.chat({
       messages: [
         { role: 'user', content: 'q' },
@@ -145,7 +156,7 @@ describe('OpenAI / OpenAI-compatible adapter', () => {
       },
     }));
 
-    const p = new OpenAIProvider('recursivesi/flint', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const p = new OpenAIProvider('recursivesi/flint', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible', transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'please continue' }] });
     expect(res.text).toBe('');
     expect(res.toolCalls).toEqual([]);
@@ -176,7 +187,7 @@ describe('OpenAI parameter adaptation (newer models)', () => {
       };
     });
 
-    const p = new OpenAIProvider('gpt-5.2', 'key');
+    const p = new OpenAIProvider('gpt-5.2', 'key', undefined, undefined, transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'x' }], maxTokens: 100 });
     expect(res.text).toBe('hi');
     expect(calls).toHaveLength(2);
@@ -205,7 +216,7 @@ describe('OpenAI parameter adaptation (newer models)', () => {
       };
     });
 
-    const p = new OpenAIProvider('o-reasoner', 'key');
+    const p = new OpenAIProvider('o-reasoner', 'key', undefined, undefined, transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'x' }], temperature: 0 });
     expect(res.text).toBe('ok');
     expect(calls).toHaveLength(2);
@@ -229,7 +240,7 @@ describe('OpenAI parameter adaptation (newer models)', () => {
       };
     });
 
-    const p = new OpenAIProvider('legacy-local', 'key');
+    const p = new OpenAIProvider('legacy-local', 'key', undefined, undefined, transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'x' }], reasoningEffort: 'low' });
     expect(res.text).toBe('ok');
     expect(calls).toHaveLength(2);
@@ -242,7 +253,7 @@ describe('OpenAI parameter adaptation (newer models)', () => {
       status: 400,
       body: { error: { message: 'Invalid request: messages must not be empty' } },
     }));
-    const p = new OpenAIProvider('gpt-test', 'key');
+    const p = new OpenAIProvider('gpt-test', 'key', undefined, undefined, transport);
     await expect(p.chat({ messages: [{ role: 'user', content: 'x' }] })).rejects.toThrow('400');
     expect(calls.length).toBeLessThanOrEqual(2);
   });
@@ -312,7 +323,7 @@ describe('Reasoning & <think> block normalization', () => {
       },
     }));
 
-    const p = new OpenAIProvider('deepseek-r1', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const p = new OpenAIProvider('deepseek-r1', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible', transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'summarize Q1' }] });
     expect(res.text).toBe('Here is the Q1 breakdown.');
     expect(res.reasoning).toBe('Evaluating Q1 revenue columns');
@@ -331,7 +342,7 @@ describe('Reasoning & <think> block normalization', () => {
       },
     }));
 
-    const p = new AnthropicProvider('claude-local', 'sk-test');
+    const p = new AnthropicProvider('claude-local', 'sk-test', undefined, transport);
     const res = await p.chat({ messages: [{ role: 'user', content: 'verify formulas' }] });
     expect(res.text).toBe('All formulas are valid.');
     expect(res.reasoning).toBe('Checking formula dependencies in B2:B10.');
@@ -394,7 +405,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
 
   it('streams reasoning_content, inline <think>, text deltas, and chunked tool_calls in OpenAIProvider', async () => {
     const requests: Record<string, unknown>[] = [];
-    vi.stubGlobal('fetch', async (_url: string | URL, init?: RequestInit) => {
+    transport = (async (_url: string | URL, init?: GuardedRequestInit) => {
       requests.push(JSON.parse(String(init?.body)));
       return createSseResponse([
         'data: {"choices":[{"delta":{"reasoning_content":"Inspecting "}}]}\n\n',
@@ -406,7 +417,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
       ]);
     });
 
-    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible', transport);
     const deltas: ChatDelta[] = [];
     const res = await p.chat({
       messages: [{ role: 'user', content: 'read A1:B2' }],
@@ -427,7 +438,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
 
   it('automatically falls back to non-streaming when a local server rejects stream: true', async () => {
     const requests: Record<string, unknown>[] = [];
-    vi.stubGlobal('fetch', async (_url: string | URL, init?: RequestInit) => {
+    transport = (async (_url: string | URL, init?: GuardedRequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       requests.push(body);
       if (body.stream) {
@@ -445,7 +456,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
       );
     });
 
-    const p = new OpenAIProvider('no-stream-model', 'lm-studio');
+    const p = new OpenAIProvider('no-stream-model', 'lm-studio', undefined, undefined, transport);
     const deltas: ChatDelta[] = [];
     const res = await p.chat({
       messages: [{ role: 'user', content: 'hi' }],
@@ -460,7 +471,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
   });
 
   it('streams thinking_delta, text_delta, and input_json_delta in AnthropicProvider', async () => {
-    vi.stubGlobal('fetch', async () =>
+    transport = (async () =>
       createSseResponse([
         'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":15,"output_tokens":1}}}\n\n',
         'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
@@ -474,7 +485,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
       ]),
     );
 
-    const p = new AnthropicProvider('claude-stream', 'sk-test');
+    const p = new AnthropicProvider('claude-stream', 'sk-test', undefined, transport);
     const deltas: ChatDelta[] = [];
     const res = await p.chat({
       messages: [{ role: 'user', content: 'check' }],
@@ -494,14 +505,14 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
 
   it('salvages streamed reasoning and returns stopReason max_tokens instead of crashing when an SSE stream hits a 413 buffer overflow', async () => {
     const giantLineWithoutNewline = 'data: {"choices":[{"delta":{"content":"' + 'x'.repeat(9 * 1024 * 1024);
-    vi.stubGlobal('fetch', async () =>
+    transport = (async () =>
       createSseResponse([
         'data: {"choices":[{"delta":{"reasoning_content":"Drafted balance sheet rows 1..33."}}]}\n\n',
         giantLineWithoutNewline,
       ]),
     );
 
-    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible', transport);
     const deltas: ChatDelta[] = [];
     const res = await p.chat({
       messages: [{ role: 'user', content: 'draft balance sheet' }],
@@ -534,7 +545,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
     expect(trimmed).toContain('Accounts Payable 220,400');
     expect(trimmed).not.toContain("This is getting too complicated. Let's step back.");
 
-    vi.stubGlobal('fetch', async () =>
+    transport = (async () =>
       createSseResponse([
         `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `${initialPlan}\n\n${repeatedDeliberation}\n\n` } }] })}\n\n`,
         `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `${indecisionBlock}\n\n${repeatedDeliberation}` } }] })}\n\n`,
@@ -542,7 +553,7 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
       ]),
     );
 
-    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible', transport);
     const deltas: ChatDelta[] = [];
     const res = await p.chat({
       messages: [{ role: 'user', content: 'create left to right balance sheet' }],

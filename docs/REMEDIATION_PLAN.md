@@ -133,16 +133,16 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 | F3 | P1 | E2a | 1 | done |
 | F4 | P1 | E3 | 2 | done |
 | F5 | P1 | E0 → E4 | 0 / 3 | done |
-| F6 | P1 | E0 → E5 | 0 / 3 | open |
-| F7 | P2 | E5 | 3 | open |
+| F6 | P1 | E0 → E5 | 0 / 3 | done |
+| F7 | P2 | E5 | 3 | done |
 | F8 | P2 | E2c | 2 | done |
 | F9 | P2 | E6 | 3 | open |
 | F10 | P2 | E6 | 3 | open |
 | F11 | P2 | E6 | 3 | open |
 | F12 | P2 | E7 | 4 | open |
 | C1 Partial apply rollback | P1 | E2b | 1 | done |
-| C2 Hostname/socket pinning | P1 | E5 | 3 | open |
-| C3 Anthropic `/v1` | P2 | E5 | 3 | open |
+| C2 Hostname/socket pinning | P1 | E5 | 3 | done |
+| C3 Anthropic `/v1` | P2 | E5 | 3 | done |
 | C4 FS read allocation | P2 | E6 | 3 | open |
 | C5 Settings corruption | P2 | E7 | 4 | open |
 | C6 Cloud docs mismatch | P2 | E9 | 4 | open |
