@@ -1,22 +1,40 @@
 # MS Excel AI Plugin
 
-**The privacy-first, bring-your-own-model AI assistant for Microsoft Excel.** Open source, 100% local, air-gapped by design.
+**The privacy-first, bring-your-own-model AI assistant for Microsoft Excel.** Open source and local-only: the sidecar talks to models on this machine and nowhere else.
 
-Connect **any** local or self-hosted AI model (LM Studio, Ollama, embedded in-process GGUF, or any OpenAI-compatible server) or private cloud endpoints (Claude, OpenAI) and let it analyze, query, and modify spreadsheets as an agent — with every change previewable and undoable before anything touches your grid.
+Connect a model running on your own machine (LM Studio, Ollama, vLLM, embedded in-process GGUF, or any server that speaks the OpenAI or Anthropic Messages API on loopback) and let it analyze, query, and modify spreadsheets as an agent — with every change previewed before anything touches your grid.
+
+> **No cloud providers.** The "OpenAI API protocol" and "Anthropic Messages protocol" model types are wire-protocol adapters for local servers and gateways. Their base URL must be `127.0.0.1`, `localhost`, or `[::1]`; `api.openai.com`, `api.anthropic.com`, and every other non-loopback host are refused when you save, test, or list models, and again before each request.
 
 ---
 
-## Key Highlights & Architectural Guarantees
+## Key Highlights
 
-* 🔒 **Air-Gap & Zero Telemetry:** Under no circumstances do workbook contents, cell formulas, user prompts, API keys, or operational telemetry leave `localhost`. An active network guard (`assertLoopbackUrl`) strictly blocks any non-loopback egress at the network socket layer.
-* 🛡️ **Safe Agentic Edits with Diff Inspection:** Writes are staged into structured change-sets with user-visible justifications. A cell-level before/after diff inspector lets you review proposed changes (e.g. `Old: 100` → `New: =SUM(A1:A5)`) before clicking **Apply**, backed by automated formula regression testing and one-click **Undo**.
-* ⚡ **Out-of-the-Box Local Default:** Pre-configured for local LM Studio (`http://127.0.0.1:1234/v1`) and Ollama (`http://127.0.0.1:11434/v1`), plus an **In-Process Embedded GGUF Engine** (`node-llama-cpp`) that runs local quantized models (Qwen 2.5, Llama 3.1) directly inside the sidecar with zero external servers.
-* 🔌 **Model Context Protocol (MCP) Connectors:** Connect local SQLite databases, local CSV directories, and local filesystem trees to the agent, strictly sandboxed to explicit user-approved paths via `PathGuard` with prompt-injection defense.
-* 📄 **Zero-Telemetry Local Document Importer:** Direct drag-and-drop or attachment of CSV, TSV, Markdown tables, and JSON arrays directly into worksheet change-sets with built-in formula injection escaping (CWE-1236).
-* 🌓 **Adaptive Office Dark Theme:** Dynamically adapts to Excel's Dark Gray, Black, and Colorful themes (`Office.context.officeTheme` and OS `prefers-color-scheme`) with a 3-way toggle (Auto / Dark / Light).
-* 🛑 **Instant Stop / Abort:** Full cancellation propagation (`AbortSignal`) across the agent loop, provider requests, custom functions (`CustomFunctions.Invocation.onCanceled`), and long-running MCP queries.
-* 🎯 **Dynamic Range Interaction:** Live selection tracking ("Include Selection" chip) and interactive "Jump to Range" navigation that scrolls and highlights proposed change targets directly on the active worksheet.
-* 🧪 **162 Automated Tests:** Exhaustive unit, component, integration, and E2E smoke tests ensuring zero regressions across all packages.
+* 🔒 **Loopback-only model traffic:** Every model request (chat, custom functions, probes, model discovery) goes through one guarded transport (`guardedFetch`). It resolves the host, connects only to a loopback address, re-checks the connected socket, and never follows redirects. Stdio MCP servers are separate programs that this guard cannot see; see [Guarantees and their limits](#guarantees-and-their-limits).
+* 🛡️ **Staged edits with a diff preview:** Writes are staged into change-sets, each with a stated reason. A cell-level before/after diff (e.g. `Old: 100` → `New: =SUM(A1:A5)`) is shown before you click **Apply**. After apply, the written ranges are re-read; a new Excel error there rolls the set back. **Undo** shows how much it can restore and refuses to overwrite later edits.
+* ⚡ **Local defaults:** Pre-configured for LM Studio (`http://127.0.0.1:1234/v1`), with one-click Ollama defaults (`http://localhost:11434/v1`), plus an optional **embedded GGUF engine** that runs a quantized model inside the sidecar (install `node-llama-cpp` yourself; it is not bundled).
+* 🔌 **Model Context Protocol (MCP) connectors:** Local SQLite databases, CSV directories, and filesystem trees, limited to folders you approve (`PathGuard`). Tool results are wrapped as untrusted data for the model.
+* 📄 **Local tabular importer:** Attach CSV, TSV, Markdown tables, or JSON arrays and stage them into a change-set, with formula-injection escaping (CWE-1236).
+* 🌓 **Office theme aware:** Follows Excel's Dark Gray, Black, and Colorful themes (`Office.context.officeTheme` and `prefers-color-scheme`), with an Auto / Dark / Light toggle.
+* 🛑 **Stop / abort:** Cancellation (`AbortSignal`) reaches the agent loop, provider requests and their sockets, custom functions (`CustomFunctions.Invocation.onCanceled`), SQLite queries, and stdio MCP calls.
+* 🎯 **Range navigation:** An "Include Selection" chip tracks the live selection, and "Jump to Range" selects a proposed change's target.
+
+## Guarantees and their limits
+
+Each row says where the guarantee is enforced and which tests check it. Anything not listed here is a design goal ([docs/DESIGN.md](docs/DESIGN.md)), not a guarantee.
+
+| Guarantee | Enforced in | Checked by | Limit |
+|---|---|---|---|
+| Model requests reach loopback only | `sidecar/src/networkGuard.ts` (`assertLoopbackUrl`, `guardedFetch`); provider config schemas in `server.ts` | `network-guard`, `transport`, `transport-dns`, `server` tests | Covers HTTP the sidecar makes. Stdio MCP servers are separate processes and can open any connection the OS allows. |
+| OS-level egress block (optional, Windows) | `scripts/lockdown-firewall.ps1` | `firewall-script` test (generated rules only) | Applies to `bin/node-offline.exe` alone. Rule creation on an elevated machine has not been verified in CI. |
+| Writes are staged, never applied directly | `sidecar/src/changeset/` | `changeset`, `agent` tests; `pnpm smoke` | Approval applies a set once, to the reviewed sheet; concurrent approvals are serialized. |
+| Applied sets are verified | `sidecar/src/changeset/manager.ts` | `changeset` tests | Written ranges only, compared by address. Formulas elsewhere that depend on them, and the meaning of formulas that evaluate cleanly, are not checked. |
+| Undo is honest | `sidecar/src/changeset/manager.ts`, `ChangeSetCard` | `changeset` tests | Restores values and formulas; each set states its undo fidelity. Change-sets are kept for 24 hours / newest 200 per workbook session. |
+| File reads stay inside approved folders | `sidecar/src/mcp/pathGuard.ts`, `boundedRead.ts` | `mcp-path-guard`, `mcp-filesystem`, `import-tool` tests | Content you attach in chat is not a file read and needs no approval. |
+| Bounded connector work | `sidecar/src/mcp/` | `mcp-sqlite`, `mcp-filesystem`, `mcp-stdio-lifecycle` tests | Row, byte, and time caps; see [docs/DESIGN.md §14](docs/DESIGN.md#14-security--privacy-model). |
+| Only paired clients drive Excel | `sidecar/src/auth.ts`, `server.ts` | `server`, `pairing` tests | The bearer token lives in the add-in's `localStorage` and the sidecar's SQLite store. |
+
+Not yet guaranteed: API keys are stored in plaintext in `settings.json` (OS keychain storage is planned), and the add-in has been exercised against an Office.js harness, not verified for calculation parity with desktop Excel.
 
 ---
 
@@ -71,7 +89,7 @@ Clone the repository and run the setup commands:
 # 1. Install dependencies without running untrusted third-party scripts
 pnpm install --ignore-scripts
 
-# 2. Verify type safety and test suite (162 tests)
+# 2. Typecheck and run the test suites
 pnpm check
 pnpm test
 
@@ -119,11 +137,13 @@ No executable installer (`.exe`) is needed. Modern Office add-ins run securely i
 ### 3. One-Time Pairing & Model Configuration
 
 1. Click the **Excel AI** button on the Home ribbon to open the taskpane.
-2. Enter the 6-character pairing code printed by the sidecar (e.g. `AB12CD`). Pairing is permanent and stored in `~/.excelai/settings.json` (mode `0600`).
+2. Enter the 6-character pairing code printed by the sidecar (e.g. `AB12CD`). The code works once; the bearer token it yields is kept in the add-in's `localStorage` and the sidecar's database in `~/.excelai`.
 3. In **Settings**:
    * **LM Studio (Default):** Ready out of the box at `http://127.0.0.1:1234/v1`.
-   * **Ollama:** Click **Use Ollama defaults** (`http://127.0.0.1:11434/v1`) $\rightarrow$ click **Scan / List models** to pick from your installed local models.
+   * **Ollama:** Click **Use Ollama defaults** (`http://localhost:11434/v1`) $\rightarrow$ click **Scan / List models** to pick from your installed local models.
    * **Embedded GGUF:** Select *Embedded GGUF* to run local quantized weights completely in-process using `node-llama-cpp`.
+   * **OpenAI API / Anthropic Messages protocol:** For a local server or gateway that speaks one of those APIs. Enter its loopback base URL; cloud URLs are refused.
+   * API keys are saved in plaintext in `~/.excelai/settings.json` (restricted to your user on macOS/Linux). The UI only ever shows the last four characters.
    * **MCP Connectors:** Switch to the **MCP Connectors** tab to whitelist approved folders and attach local SQLite databases or CSV collections.
 
 ---
@@ -170,7 +190,8 @@ Use the table below to tune **LM Studio**, **Ollama**, or **Embedded GGUF** for 
 * When the agent proposes workbook modifications, nothing changes immediately.
 * An interactive **Change-Set Card** appears in the chat showing each affected cell with its prior value and proposed new value/formula.
 * Click any range address to navigate directly to it on the active sheet.
-* Click **Apply** to write changes to Excel with atomic verification, or **Undo** to roll back at any time.
+* Click **Apply** to write the changes. The written ranges are re-read, and the set is rolled back if a new Excel error appears there or the re-read fails.
+* Click **Undo** to restore the prior values and formulas. The card states how complete the undo is, and undo stops with a conflict instead of overwriting cells edited since.
 
 ### 🗄️ Model Context Protocol (MCP) Connectors
 * Go to **Settings** $\rightarrow$ **MCP Connectors**.
@@ -224,8 +245,8 @@ Everything lives in `~/.excelai` (or `EXCELAI_DATA_DIR`), and nothing grows with
 │   ├── src/agent/       # Agent loop, tool schemas, repair cycles, prompt defense
 │   ├── src/mcp/         # MCP subsystem (PathGuard, SQLite, CSV, FS, stdio client)
 │   ├── src/importers/   # Pure TypeScript tabular parsers (CSV, TSV, Markdown, JSON)
-│   ├── src/providers/   # LM Studio / Ollama / OpenAI / Anthropic / Embedded GGUF
-│   ├── src/server.ts    # Fastify-style HTTP + WebSocket server with pairing auth
+│   ├── src/providers/   # OpenAI-API and Anthropic-Messages protocol adapters (loopback only), embedded GGUF
+│   ├── src/server.ts    # node:http + ws server with pairing auth
 │   ├── src/networkGuard.ts # Central loopback-only assertion guard
 │   └── test/            # Vitest unit and integration test suites
 ├── shared/              # Shared TypeScript definitions, schemas, and A1 math
@@ -242,7 +263,7 @@ Run the full verification pipeline:
 # Type check all packages
 pnpm check
 
-# Run all 162 unit and integration tests
+# Run the unit and integration tests
 pnpm test
 
 # Build production distribution

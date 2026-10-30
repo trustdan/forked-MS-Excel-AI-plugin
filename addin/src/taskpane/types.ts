@@ -51,8 +51,9 @@ export interface ProviderList {
 }
 
 export const KIND_LABELS: Record<ProviderKind, string> = {
-  anthropic: 'Anthropic',
-  openai: 'OpenAI',
+  // Wire protocols, not cloud services: every endpoint must be on loopback.
+  anthropic: 'Anthropic Messages protocol (local server)',
+  openai: 'OpenAI API protocol (local server)',
   'openai-compatible': 'OpenAI-compatible (Ollama, LM Studio, …)',
   embedded: 'Embedded GGUF (In-Process node-llama-cpp)',
 };

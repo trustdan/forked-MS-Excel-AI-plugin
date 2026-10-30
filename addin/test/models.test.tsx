@@ -69,6 +69,43 @@ describe('ModelsScreen Component', () => {
     });
   });
 
+  it('labels cloud-named kinds as local protocol adapters with an editable loopback URL', async () => {
+    const mockApi = vi.spyOn(connection, 'api').mockImplementation(async (path, init) => {
+      if (path === '/api/settings/providers' && !init?.method) {
+        return { providers: [], activeProviderId: null };
+      }
+      if (path === '/api/settings/providers' && init?.method === 'POST') {
+        return { id: 'p1', activeProviderId: 'p1' };
+      }
+      return {};
+    });
+
+    render(<ModelsScreen onChanged={vi.fn()} />);
+    const select = (await screen.findByLabelText(/Provider/i)) as HTMLSelectElement;
+    const labels = Array.from(select.options).map((o) => o.text);
+    expect(labels).toContain('Anthropic Messages protocol (local server)');
+    expect(labels).toContain('OpenAI API protocol (local server)');
+    expect(labels).not.toContain('Anthropic');
+    expect(labels).not.toContain('OpenAI');
+
+    fireEvent.change(select, { target: { value: 'anthropic' } });
+    expect(screen.getByText(/Cloud endpoints are blocked/i)).toBeDefined();
+    const baseUrl = screen.getByLabelText(/Base URL/i) as HTMLInputElement;
+    fireEvent.change(baseUrl, { target: { value: 'http://127.0.0.1:4000' } });
+    fireEvent.change(screen.getByLabelText(/^Model/i), { target: { value: 'claude-local' } });
+    fireEvent.click(screen.getByRole('button', { name: /Add model/i }));
+
+    await waitFor(() => {
+      const post = mockApi.mock.calls.find(
+        ([p, i]) => p === '/api/settings/providers' && i?.method === 'POST',
+      );
+      expect(JSON.parse(String(post?.[1]?.body))).toMatchObject({
+        kind: 'anthropic',
+        baseUrl: 'http://127.0.0.1:4000',
+      });
+    });
+  });
+
   it('shows a settings-file problem and dismisses it', async () => {
     let problem: object | undefined = {
       kind: 'unreadable',

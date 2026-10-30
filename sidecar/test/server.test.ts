@@ -220,6 +220,39 @@ describe('sidecar HTTP API', () => {
     expect(embedded).toBeDefined();
     expect(embedded?.kind).toBe('embedded');
   });
+
+  // The `anthropic` and `openai` kinds are wire protocols for local servers,
+  // not cloud integrations: their vendors' URLs are refused everywhere.
+  it('refuses cloud endpoints for the anthropic and openai protocol kinds', async () => {
+    const { base, token } = await boot();
+    const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    const cases = [
+      { kind: 'anthropic', baseUrl: 'https://api.anthropic.com' },
+      { kind: 'openai', baseUrl: 'https://api.openai.com/v1' },
+    ];
+    for (const c of cases) {
+      for (const path of ['/api/settings/providers', '/api/settings/providers/test', '/api/providers/models']) {
+        const res = await fetch(`${base}${path}`, {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({ ...c, model: 'm', apiKey: 'k' }),
+        });
+        expect(res.status, `${c.kind} ${path}`).toBe(400);
+        expect(JSON.stringify(await res.json())).toMatch(/loopback/);
+      }
+    }
+    const list = (await (await fetch(`${base}/api/settings/providers`, { headers: auth })).json()) as {
+      providers: { baseUrl?: string }[];
+    };
+    expect(list.providers.filter((p) => p.baseUrl && !p.baseUrl.startsWith('http://127.0.0.1'))).toEqual([]);
+
+    const local = await fetch(`${base}/api/settings/providers`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ kind: 'anthropic', model: 'm', baseUrl: 'http://127.0.0.1:4000' }),
+    });
+    expect(local.status).toBe(200);
+  });
 });
 
 describe('sidecar WebSocket hardening', () => {
