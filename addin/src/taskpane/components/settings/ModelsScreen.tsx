@@ -207,10 +207,11 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
                 });
               }}
             >
-              <option value="openai-compatible">OpenAI-compatible (LM Studio, Ollama, …)</option>
-              <option value="embedded">Embedded GGUF (In-Process node-llama-cpp)</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
+              {(['openai-compatible', 'embedded', 'openai', 'anthropic'] as const).map((k) => (
+                <option key={k} value={k}>
+                  {KIND_LABELS[k]}
+                </option>
+              ))}
             </select>
           </label>
           {form.kind === 'embedded' && (
@@ -218,16 +219,24 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
               💡 Runs completely in-process. Place your <code>.gguf</code> model files in <code>~/.excelai/models/</code> and click <em>Scan local models</em>.
             </div>
           )}
+          {(form.kind === 'openai' || form.kind === 'anthropic') && (
+            <div className="hint" style={{ marginBottom: '10px' }}>
+              Speaks the {form.kind === 'openai' ? 'OpenAI' : 'Anthropic Messages'} API to a server on this
+              machine, such as a local gateway. Cloud endpoints are blocked.
+            </div>
+          )}
+          {form.kind !== 'embedded' && (
+            <label>
+              Base URL
+              <input
+                value={form.baseUrl}
+                placeholder="http://127.0.0.1:1234/v1"
+                onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
+              />
+            </label>
+          )}
           {form.kind === 'openai-compatible' && (
             <>
-              <label>
-                Base URL
-                <input
-                  value={form.baseUrl}
-                  placeholder="http://127.0.0.1:1234/v1"
-                  onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
-                />
-              </label>
               <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
                 <button
                   type="button"
@@ -292,7 +301,7 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
               onClick={loadModels}
               disabled={
                 busyAction !== '' ||
-                (form.kind !== 'embedded' && form.kind !== 'openai' && form.kind !== 'anthropic' && !form.baseUrl)
+                (form.kind !== 'embedded' && !form.baseUrl)
               }
             >
               {busyAction === 'models'

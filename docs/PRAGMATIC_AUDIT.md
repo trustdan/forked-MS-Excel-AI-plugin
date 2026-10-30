@@ -183,3 +183,33 @@ These are source-level follow-ups, not reproduced native-engine or long-duration
 5. Tighten cache identity, native/process cleanup, retention budgets, atomic settings persistence, and documentation/CI consistency.
 
 The useful pragmatic principle here is to make guarantees executable at their owning boundary. Types and prompts describe the intended contract; real execution must enforce it. The existing modular structure can support these repairs without a wholesale architecture replacement.
+
+**Resolution (2026-10-30)**
+
+Every finding above was fixed in the remediation epics of [REMEDIATION_PLAN.md](REMEDIATION_PLAN.md), each with a regression test that fails on `ea2f25d`. The text above still describes `ea2f25d` and is not updated.
+
+| Finding | Resolved in |
+| --- | --- |
+| 1 Missing worksheet redirects mutations | `d80e928` (E1) |
+| 2 Formula repair changes meaning | `618ab8e` (E3) |
+| 3 Concurrent approvals | `a400cf6` (E2a) |
+| 4 One error disables rollback | `618ab8e` (E3) |
+| 5 Malformed WebSocket input | `d80e928` (E0 stop-gap), `1f183b2` (E4) |
+| 6 Discovery follows redirects | `d80e928` (E0 stop-gap), `e45cea1` (E5) |
+| 7 SSE buffered until EOF | `e45cea1` (E5) |
+| 8 Undo overstates or overwrites | `b7e1a7c` (E2c) |
+| 9 Importer bypasses approved paths | `6d5bc19` (E6) |
+| 10 SQLite row limit bypass | `6d5bc19` (E6) |
+| 11 MCP numeric arguments | `6d5bc19` (E6) |
+| 12 Function cache conflates configs | `ed82ffb` (E7) |
+| Partial apply not rolled back | `a49dd82` (E2b) |
+| Hostname validation vs. socket | `e45cea1` (E5) |
+| Anthropic doubles `/v1` | `e45cea1` (E5) |
+| Filesystem reads allocate first | `6d5bc19` (E6) |
+| Settings corruption | `ed82ffb` (E7) |
+| Cloud documentation | `81e825c` (E9) |
+| CI `--ignore-scripts` / README count | `d80e928` (E0), `81e825c` (E9) |
+| Embedded lifecycle | `8d7daf2` (E8) |
+| Stdio MCP deadlines | `8d7daf2` (E8) |
+| Retention budgets | `ed82ffb` (E7) |
+| Firewall IPv6 | `8d7daf2` (E8); rule creation on an elevated test machine is still unverified |

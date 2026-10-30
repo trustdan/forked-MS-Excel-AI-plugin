@@ -54,7 +54,7 @@ sharing protocol types and tool schemas (`shared/`). Design doc: `docs/DESIGN.md
 - `shared/src/` — Tool schemas (`zod`), WS protocol envelopes, change-set structures, A1 notation utilities
 - `sidecar/src/agent/` — Tool-calling loop, schema validation, repair-retry, system prompts
 - `sidecar/src/changeset/` — Stage → preview → approve → apply → verify (auto-rollback) → undo
-- `sidecar/src/providers/` — OpenAI-compatible (LM Studio / Ollama / vLLM), Anthropic, scripted (tests)
+- `sidecar/src/providers/` — OpenAI-API and Anthropic-Messages protocol adapters for loopback servers (LM Studio / Ollama / vLLM / local gateways), embedded GGUF, scripted (tests)
 - `sidecar/src/networkGuard.ts` — Loopback network guard blocking all non-local connections
 - `sidecar/src/workbook/` — Workbook executor interface, headless emulator, formula engine
 - `sidecar/test/` — Unit and integration tests; `sidecar/scripts/smoke.mjs` — E2E smoke test
