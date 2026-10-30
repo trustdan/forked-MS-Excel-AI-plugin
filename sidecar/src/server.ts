@@ -4,7 +4,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { PROTOCOL_VERSION, type ClientMessage, type McpServerConfig } from '@excelai/shared';
+import { PROTOCOL_VERSION, clientMessageSchema, makeEnvelope, type McpServerConfig } from '@excelai/shared';
 import { z } from 'zod';
 import { Auth } from './auth.js';
 import {
@@ -30,6 +30,8 @@ const MAX_CACHED_SESSIONS = 50;
 // Largest legitimate frame is a tool_result carrying a range snapshot; 16 MiB
 // leaves headroom over MAX_SNAPSHOT_CELLS while staying far below ws's 100 MiB default.
 const MAX_WS_PAYLOAD_BYTES = 16 * 1024 * 1024;
+/** Malformed frames tolerated per socket; the next one closes it (1008). */
+const MAX_PROTOCOL_VIOLATIONS = 3;
 
 /** Origins allowed to talk to the sidecar (Office webviews + local dev). */
 const ALLOWED_ORIGIN_RE =
@@ -543,35 +545,45 @@ export async function startServer(options: {
   wss.on('connection', (ws: WebSocket) => {
     let session: Session | null = null;
     let bridge: BridgeExecutor | null = null;
+    let violations = 0;
 
     ws.on('error', (err) => {
       console.error('[ws] socket error:', err.message);
     });
 
-    ws.on('message', (raw) => {
+    /** Answer a malformed frame with a typed error; repeated offenders are closed. */
+    const rejectFrame = (message: string, issues: string[], refId?: string): void => {
+      violations += 1;
+      ws.send(
+        JSON.stringify(makeEnvelope('protocol_error', { message, issues: issues.slice(0, 10), refId })),
+      );
+      if (violations >= MAX_PROTOCOL_VIOLATIONS) ws.close(1008, 'Too many malformed frames');
+    };
+
+    ws.on('message', (raw, isBinary) => {
       (async () => {
+        if (isBinary) {
+          rejectFrame('Binary frames are not supported', []);
+          return;
+        }
         let parsed: unknown;
         try {
           parsed = JSON.parse(String(raw));
         } catch {
+          rejectFrame('Frame is not valid JSON', []);
           return;
         }
-        // Stop-gap until envelopes are schema-validated: anything that isn't a
-        // plain object (null, arrays, primitives) is a protocol violation.
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          ws.close(1003, 'Malformed frame');
-          return;
-        }
-        const msg = parsed as ClientMessage;
-        if (typeof msg.v !== 'number' || Math.floor(msg.v) !== PROTOCOL_VERSION) {
+        const frame = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as Record<string, unknown>;
+        const refId = typeof frame.id === 'string' ? frame.id.slice(0, 128) : undefined;
+        if (typeof frame.v === 'number' && Math.floor(frame.v) !== PROTOCOL_VERSION) {
           ws.send(
             JSON.stringify({
               v: PROTOCOL_VERSION,
-              id: msg.id ?? 'unknown',
+              id: refId ?? 'unknown',
               type: 'hello_ack',
               payload: {
                 ok: false,
-                error: `Protocol version mismatch (sidecar ${PROTOCOL_VERSION}, client ${String(msg.v)}). Update both sides.`,
+                error: `Protocol version mismatch (sidecar ${PROTOCOL_VERSION}, client ${String(frame.v)}). Update both sides.`,
                 sidecarVersion: SIDECAR_VERSION,
               },
             }),
@@ -579,6 +591,16 @@ export async function startServer(options: {
           ws.close();
           return;
         }
+        const result = clientMessageSchema.safeParse(parsed);
+        if (!result.success) {
+          rejectFrame(
+            'Malformed frame',
+            result.error.issues.map((i) => `${i.path.join('.') || '(frame)'}: ${i.message}`),
+            refId,
+          );
+          return;
+        }
+        const msg = result.data;
         switch (msg.type) {
           case 'hello': {
             if (!auth.verify(msg.payload.token)) {
@@ -627,7 +649,7 @@ export async function startServer(options: {
             await session?.handleChat(msg.payload.message);
             break;
           case 'abort':
-            session?.handleAbort(msg.payload?.reason);
+            session?.handleAbort(msg.payload.reason);
             break;
           case 'approve_changeset':
             await session?.handleApprove(msg.payload.changeSetId);

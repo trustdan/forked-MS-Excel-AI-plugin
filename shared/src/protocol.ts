@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { ChangeOp, ChangePreviewItem, ChangeSetStatus, UndoFidelity } from './changeset.js';
 
 /**
@@ -22,31 +23,53 @@ export interface Envelope<T extends string, P> {
 
 /* ---------- add-in -> sidecar ---------- */
 
-export type ClientHello = Envelope<
+/**
+ * Client frames are untrusted input: the sidecar parses every one against
+ * these schemas before dispatch, and the static types are derived from them.
+ */
+const id = z.string().min(1).max(128);
+
+function envelope<T extends string, P extends z.ZodTypeAny>(type: T, payload: P) {
+  return z.object({ v: z.number(), id, type: z.literal(type), payload });
+}
+
+const clientHelloSchema = envelope(
   'hello',
-  { token: string; workbookId: string; workbookName: string; client: 'addin' | 'devtool' }
->;
-
-export type ChatRequest = Envelope<'chat', { message: string }>;
-
-export type ToolResult = Envelope<
+  z.object({
+    token: z.string().max(512),
+    workbookId: z.string().min(1).max(512),
+    workbookName: z.string().max(1024),
+    client: z.enum(['addin', 'devtool']),
+  }),
+);
+const chatRequestSchema = envelope('chat', z.object({ message: z.string() }));
+const toolResultSchema = envelope(
   'tool_result',
-  { requestId: string; ok: boolean; result?: unknown; error?: string }
->;
+  z.object({ requestId: id, ok: z.boolean(), result: z.unknown().optional(), error: z.string().optional() }),
+);
+const approveChangeSetSchema = envelope('approve_changeset', z.object({ changeSetId: id }));
+const rejectChangeSetSchema = envelope('reject_changeset', z.object({ changeSetId: id }));
+const undoChangeSetSchema = envelope('undo_changeset', z.object({ changeSetId: id }));
+const abortRequestSchema = envelope('abort', z.object({ reason: z.string().max(1024).optional() }));
 
-export type ApproveChangeSet = Envelope<'approve_changeset', { changeSetId: string }>;
-export type RejectChangeSet = Envelope<'reject_changeset', { changeSetId: string }>;
-export type UndoChangeSet = Envelope<'undo_changeset', { changeSetId: string }>;
-export type AbortRequest = Envelope<'abort', { reason?: string }>;
+export const clientMessageSchema = z.discriminatedUnion('type', [
+  clientHelloSchema,
+  chatRequestSchema,
+  toolResultSchema,
+  approveChangeSetSchema,
+  rejectChangeSetSchema,
+  undoChangeSetSchema,
+  abortRequestSchema,
+]);
 
-export type ClientMessage =
-  | ClientHello
-  | ChatRequest
-  | ToolResult
-  | ApproveChangeSet
-  | RejectChangeSet
-  | UndoChangeSet
-  | AbortRequest;
+export type ClientHello = z.infer<typeof clientHelloSchema>;
+export type ChatRequest = z.infer<typeof chatRequestSchema>;
+export type ToolResult = z.infer<typeof toolResultSchema>;
+export type ApproveChangeSet = z.infer<typeof approveChangeSetSchema>;
+export type RejectChangeSet = z.infer<typeof rejectChangeSetSchema>;
+export type UndoChangeSet = z.infer<typeof undoChangeSetSchema>;
+export type AbortRequest = z.infer<typeof abortRequestSchema>;
+export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 /* ---------- sidecar -> add-in ---------- */
 
@@ -86,7 +109,16 @@ export type AgentEvent = Envelope<
   | { kind: 'done' }
 >;
 
-export type ServerMessage = ServerHello | ToolExecRequest | ApplyOpsRequest | AgentEvent;
+/**
+ * The sidecar rejected a client frame. `refId` echoes the frame's id when it
+ * had one. Repeated violations close the socket (1008).
+ */
+export type ProtocolError = Envelope<
+  'protocol_error',
+  { message: string; issues: string[]; refId?: string }
+>;
+
+export type ServerMessage = ServerHello | ToolExecRequest | ApplyOpsRequest | AgentEvent | ProtocolError;
 
 export function makeEnvelope<T extends string, P>(type: T, payload: P, id?: string): Envelope<T, P> {
   return {
