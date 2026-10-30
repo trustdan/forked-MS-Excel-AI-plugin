@@ -18,10 +18,10 @@ import type { Db } from './db.js';
 import { Ledger } from './ledger.js';
 import { MemoryStore } from './memory/store.js';
 import { FunctionEngine } from './functions/batch.js';
-import { createProvider, ProviderError, getModelsDir, listLocalGgufModels, type Provider } from './providers/index.js';
+import { anthropicUrl, createProvider, ProviderError, getModelsDir, listLocalGgufModels, type Provider } from './providers/index.js';
 import { BridgeExecutor } from './bridge.js';
 import { Session } from './session.js';
-import { assertLoopbackUrl } from './networkGuard.js';
+import { assertLoopbackUrl, guardedFetch } from './networkGuard.js';
 import { loadAndParseLocalFile, parseTabularContent } from './importers/tabular.js';
 import { McpManager, PathGuard } from './mcp/index.js';
 
@@ -756,7 +756,7 @@ async function listModels(config: {
     let endpoint: string;
     const headers: Record<string, string> = {};
     if (config.kind === 'anthropic') {
-      endpoint = `${rawBase.replace(/\/$/, '')}/v1/models`;
+      endpoint = anthropicUrl(rawBase, 'models');
       if (config.apiKey) headers['x-api-key'] = config.apiKey;
       headers['anthropic-version'] = '2023-06-01';
     } else {
@@ -764,9 +764,11 @@ async function listModels(config: {
       const key = config.apiKey || 'lm-studio';
       headers.authorization = `Bearer ${key}`;
     }
-    assertLoopbackUrl(endpoint);
-    // A redirect could point anywhere; the loopback check above only covers the first hop.
-    const res = await fetch(endpoint, { headers, signal: controller.signal, redirect: 'error' });
+    const res = await guardedFetch(endpoint, {
+      headers,
+      signal: controller.signal,
+      maxResponseBytes: 1024 * 1024,
+    });
     if (!res.ok) return { models: [], error: `Endpoint answered ${res.status}` };
     const data = (await res.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };
     const items = data.data ?? data.models ?? [];

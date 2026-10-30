@@ -13,7 +13,7 @@ import {
   readSseStream,
   trimRuminatingReasoning,
 } from './sse.js';
-import { assertLoopbackUrl, loopbackFetch } from '../networkGuard.js';
+import { assertLoopbackUrl, guardedFetch, type Transport } from '../networkGuard.js';
 
 /**
  * OpenAI Chat Completions adapter. With a custom baseUrl this same adapter
@@ -39,6 +39,7 @@ export class OpenAIProvider implements Provider {
     private readonly apiKey: string | undefined = 'lm-studio',
     private readonly baseUrl = 'http://127.0.0.1:1234/v1',
     readonly id: string = 'openai',
+    private readonly transport: Transport = guardedFetch,
   ) {
     assertLoopbackUrl(this.baseUrl);
   }
@@ -145,9 +146,8 @@ export class OpenAIProvider implements Provider {
     headers.authorization = `Bearer ${key}`;
 
     const endpoint = `${this.baseUrl.replace(/\/$/, '')}/chat/completions`;
-    assertLoopbackUrl(endpoint);
 
-    return loopbackFetch(endpoint, {
+    return this.transport(endpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),

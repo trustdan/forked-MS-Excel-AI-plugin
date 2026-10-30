@@ -11,7 +11,13 @@ import {
   ThinkStreamSplitter,
   readSseStream,
 } from './sse.js';
-import { assertLoopbackUrl, loopbackFetch } from '../networkGuard.js';
+import { assertLoopbackUrl, guardedFetch, type Transport } from '../networkGuard.js';
+
+/** Anthropic paths are rooted at `/v1`; accept a base URL given with or without it. */
+export function anthropicUrl(baseUrl: string, path: 'messages' | 'models'): string {
+  const base = baseUrl.replace(/\/+$/, '');
+  return `${base.endsWith('/v1') ? base : `${base}/v1`}/${path}`;
+}
 
 interface AnthropicContentBlock {
   type: string;
@@ -32,6 +38,7 @@ export class AnthropicProvider implements Provider {
     readonly model: string,
     private readonly apiKey: string = 'lm-studio',
     private readonly baseUrl = 'http://127.0.0.1:1234/v1',
+    private readonly transport: Transport = guardedFetch,
   ) {
     assertLoopbackUrl(this.baseUrl);
   }
@@ -110,10 +117,7 @@ export class AnthropicProvider implements Provider {
       }));
     }
 
-    const endpoint = `${this.baseUrl.replace(/\/$/, '')}/v1/messages`;
-    assertLoopbackUrl(endpoint);
-
-    return loopbackFetch(endpoint, {
+    return this.transport(anthropicUrl(this.baseUrl, 'messages'), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
