@@ -1,4 +1,5 @@
 import {
+  isExcelErrorCode,
   parseA1,
   formatA1,
   rangeHeight,
@@ -160,9 +161,11 @@ export class WorkbookEmulator implements WorkbookExecutor, CellResolver {
       const row: CellData[] = [];
       for (let c = addr.startCol; c <= addr.endCol; c++) {
         const cell = this.sheets.get(addr.sheet)!.get(`${r},${c}`);
+        const value = this.getCell(addr.sheet, r, c);
         row.push({
-          value: this.getCell(addr.sheet, r, c),
+          value,
           ...(cell?.formula !== undefined ? { formula: cell.formula } : {}),
+          ...(isExcelErrorCode(value) ? { error: value as string } : {}),
         });
       }
       out.push(row);

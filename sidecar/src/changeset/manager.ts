@@ -3,6 +3,8 @@ import {
   parseA1,
   formatA1,
   rangeCellCount,
+  rangesOverlap,
+  type RangeAddress,
   type CellData,
   type ChangeOp,
   type ChangePreviewItem,
@@ -31,9 +33,13 @@ const NOT_UNDOABLE: ChangeOp['kind'][] = [
 export interface ApplyResult {
   ok: boolean;
   /**
-   * Verification problems found after apply. When there are any, the set is
-   * rolled back: its status says whether that fully succeeded.
+   * `passed`: every written range was re-read and holds no new or changed
+   * error value. `regressions`: it does, and the set was rolled back.
+   * `incomplete`: a written range could not be re-read, so the result is
+   * unknown; the set was rolled back rather than reported as verified.
    */
+  verification: 'passed' | 'regressions' | 'incomplete';
+  /** What failed verification. When there is anything, the set's status says whether rollback fully succeeded. */
   problems: string[];
 }
 
@@ -43,8 +49,9 @@ export interface ApplyResult {
  * Safety contract:
  *  - ops are staged, never applied directly by the agent;
  *  - before apply, affected ranges are snapshotted for undo;
- *  - after apply, touched ranges are re-read and scanned for newly introduced
- *    error values; any regression rolls the change-set back automatically;
+ *  - after apply, written ranges are re-read and compared with the snapshot
+ *    cell by cell; a new or changed error value, or a range that can't be
+ *    re-read, rolls the change-set back automatically;
  *  - undo refuses to overwrite cells that changed after apply.
  */
 export class ChangeSetManager {
@@ -159,8 +166,13 @@ export class ChangeSetManager {
       const mapBefore = await this.executor.getWorkbookMap();
       assertTargetsUnchanged(cs.targets, mapBefore);
       sheetsBefore = new Set(mapBefore.sheets.map((s) => s.id));
+      // Sheet names this set itself creates (by adding or renaming) can't be read before it runs.
+      const newNames = new Set([
+        ...addedSheetNames(cs.ops),
+        ...cs.ops.flatMap((op) => (op.kind === 'rename_sheet' ? [op.newName.toLowerCase()] : [])),
+      ]);
 
-      // 1. Snapshot affected ranges for undo.
+      // 1. Snapshot affected ranges for undo and for the error baseline.
       const snapshots: RangeSnapshot[] = [];
       let snapshotCells = 0;
       for (const op of cs.ops) {
@@ -172,50 +184,39 @@ export class ChangeSetManager {
             `Change-set touches more than ${MAX_SNAPSHOT_CELLS} cells; refusing to apply without splitting it up`,
           );
         }
-        let cells: CellData[][];
-        try {
-          cells = await this.executor.readRange(op.range);
-        } catch {
-          continue; // sheet does not exist yet (created earlier in this set)
-        }
-        snapshots.push({ range: formatA1(addr), cells });
+        // Any read failure other than on such a sheet aborts the apply.
+        if (newNames.has(addr.sheet.toLowerCase())) continue;
+        snapshots.push({ range: formatA1(addr), cells: await this.executor.readRange(op.range) });
       }
       cs.snapshots = snapshots;
-
-      const beforeErrors = countErrors(snapshots.flatMap((s) => s.cells));
 
       // 2. Apply.
       touched = true;
       await this.executor.applyOps(cs.ops);
 
-      // 3. Verify: re-read touched ranges and scan for newly introduced errors.
-      // The re-read is also what undo later checks for conflicting edits.
-      const problems: string[] = [];
+      // 3. Verify: re-read every written range. The re-read is also what undo
+      // later checks for conflicting edits. Scope: the written ranges only;
+      // dependents elsewhere in the workbook are not checked.
       const appliedCells: RangeSnapshot[] = [];
+      const unreadable: string[] = [];
       for (const op of cs.ops) {
         if (op.kind !== 'write_range' && op.kind !== 'clear_range' && op.kind !== 'sort_range') continue;
-        let after: CellData[][];
+        const range = formatA1(parseA1(op.range));
         try {
-          after = await this.executor.readRange(op.range);
-        } catch {
-          continue;
-        }
-        appliedCells.push({ range: formatA1(parseA1(op.range)), cells: after });
-        for (const [r, row] of after.entries()) {
-          for (const [c, cell] of row.entries()) {
-            if (typeof cell.value === 'string' && cell.value.startsWith('#')) {
-              // Writing an error value intentionally is almost never what the
-              // user asked for; surface every error in the written range.
-              problems.push(`${op.range} row ${r + 1} col ${c + 1} now contains ${cell.value}`);
-            }
-          }
+          appliedCells.push({ range, cells: await this.executor.readRange(op.range) });
+        } catch (e) {
+          unreadable.push(`${range} could not be re-read: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-
-      if (problems.length > 0 && beforeErrors === 0) {
-        // Regression introduced by this change-set: roll back.
+      if (unreadable.length > 0) {
         await this.rollback(cs, sheetsBefore);
-        return { ok: false, problems };
+        return { ok: false, verification: 'incomplete', problems: unreadable };
+      }
+
+      const problems = newErrors(snapshots, appliedCells, cs.ops);
+      if (problems.length > 0) {
+        await this.rollback(cs, sheetsBefore);
+        return { ok: false, verification: 'regressions', problems };
       }
 
       const added = await this.findAddedSheets(cs, sheetsBefore);
@@ -223,7 +224,7 @@ export class ChangeSetManager {
       cs.appliedCells = appliedCells;
       cs.addedSheets = added;
       cs.status = 'applied';
-      return { ok: true, problems: [] };
+      return { ok: true, verification: 'passed', problems: [] };
     } catch (e) {
       if (touched) await this.rollback(cs, sheetsBefore);
       else cs.status = 'staged';
@@ -497,12 +498,54 @@ function describeStructural(op: ChangeOp): string {
   }
 }
 
-function countErrors(cells: CellData[][]): number {
-  let n = 0;
-  for (const row of cells) {
-    for (const cell of row) {
-      if (typeof cell.value === 'string' && cell.value.startsWith('#')) n++;
+/**
+ * Error values the apply introduced, by address: a cell is a regression when
+ * it holds an error it did not hold before (absent, or a different code).
+ * Inside a sorted range errors move with their rows, so there an error counts
+ * only when that code now occurs more often in the range than before.
+ */
+function newErrors(before: RangeSnapshot[], after: RangeSnapshot[], ops: ChangeOp[]): string[] {
+  const errorsBefore = errorsByCell(before);
+  const errorsAfter = errorsByCell(after);
+  const sorted = ops.flatMap((op) => (op.kind === 'sort_range' ? [parseA1(op.range)] : []));
+  const inSorted = (cell: string) => sorted.find((a) => rangesOverlap(a, parseA1(cell)));
+
+  const problems: string[] = [];
+  const sortAllowance = new Map<RangeAddress, Map<string, number>>();
+  for (const area of sorted) {
+    const counts = new Map<string, number>();
+    for (const [cell, code] of errorsBefore) {
+      if (rangesOverlap(area, parseA1(cell))) counts.set(code, (counts.get(code) ?? 0) + 1);
+    }
+    sortAllowance.set(area, counts);
+  }
+  for (const [cell, code] of errorsAfter) {
+    const area = inSorted(cell);
+    if (area) {
+      const left = sortAllowance.get(area)!;
+      const n = left.get(code) ?? 0;
+      if (n > 0) {
+        left.set(code, n - 1);
+        continue;
+      }
+    } else if (errorsBefore.get(cell) === code) {
+      continue;
+    }
+    const was = errorsBefore.get(cell);
+    problems.push(`${cell} now contains ${code}${was ? ` (was ${was})` : ''}`);
+  }
+  return problems;
+}
+
+function errorsByCell(snapshots: RangeSnapshot[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const snap of snapshots) {
+    const addr = parseA1(snap.range);
+    for (const [r, row] of snap.cells.entries()) {
+      for (const [c, cell] of row.entries()) {
+        if (cell.error !== undefined) out.set(cellA1(addr.sheet, addr.startRow + r, addr.startCol + c), cell.error);
+      }
     }
   }
-  return n;
+  return out;
 }

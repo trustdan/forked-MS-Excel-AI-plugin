@@ -149,6 +149,8 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
   const pendingOps: ChangeOp[] = [];
   const seenCalls = new Map<string, { count: number; lastResult: string }>();
   const writeRangeStartHistory = new Set<string>();
+  // Formulas flagged this turn (cell -> formula); sent again unchanged, they count as confirmed.
+  const flaggedFormulas = new Map<string, string>();
   const duplicateAssistantIndices = new Set<number>();
   const duplicateToolCallIds = new Set<string>();
   const recoveryMessageIndices = new Set<number>();
@@ -381,7 +383,10 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
       const canonicalName = normalizeToolName(call.name);
       const callSig = `${canonicalName}:${call.argsJson.trim()}`;
       const prevCall = seenCalls.get(callSig);
-      if (prevCall) {
+      // Re-sending a write whose formulas were flagged confirms them, so it must run again.
+      const confirmsFlaggedWrite =
+        prevCall !== undefined && (safeParseJson(prevCall.lastResult) as { diagnostics?: unknown } | null)?.diagnostics !== undefined;
+      if (prevCall && !confirmsFlaggedWrite) {
         prevCall.count++;
         forceTextReplyNext = true;
         duplicateToolCallIds.add(call.id);
@@ -407,6 +412,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
           messages,
           pendingOps,
           emit,
+          flaggedFormulas,
           options.mcpManager,
           abortSignal,
           (normalizedArgsJson, writeStartKey) => {
@@ -498,6 +504,7 @@ async function executeToolCall(
   messages: ChatMessage[],
   pendingOps: ChangeOp[],
   onEvent: (ev: AgentEvent) => void,
+  flaggedFormulas: Map<string, string>,
   mcpManager?: McpManager,
   abortSignal?: AbortSignal,
   onArgsNormalized?: (normalizedArgsJson: string, writeStartKey?: string) => void,
@@ -535,6 +542,8 @@ async function executeToolCall(
     return errorResult('Tool arguments were not valid JSON. Re-send the call with valid JSON arguments.');
   }
 
+  let formulaCorrections: FormulaCorrection[] = [];
+  let confirmedFormulas: FormulaDiagnostic[] = [];
   if (typeof rawArgs === 'object' && rawArgs !== null) {
     const rec = rawArgs as Record<string, unknown>;
     if (typeof rec.range === 'string' && rec.range.trim().length > 0) {
@@ -546,10 +555,28 @@ async function executeToolCall(
       );
     }
     if (toolName === 'write_range' && Array.isArray(rec.cells)) {
-      rec.cells = repairWriteRangeCells(
+      const repaired = repairWriteRangeCells(
         typeof rec.range === 'string' ? rec.range : 'Sheet1!A1',
         rec.cells as unknown[],
       );
+      rec.cells = repaired.cells;
+      formulaCorrections = repaired.corrections;
+      // Never rewrite a reference: send it back, unless the model already saw it flagged and kept it.
+      confirmedFormulas = repaired.diagnostics.filter((d) => flaggedFormulas.get(d.cell) === d.formula);
+      const unresolved = repaired.diagnostics.filter((d) => !confirmedFormulas.includes(d));
+      if (unresolved.length > 0) {
+        for (const d of unresolved) flaggedFormulas.set(d.cell, d.formula);
+        return JSON.stringify({
+          ok: false,
+          staged: false,
+          error:
+            'Nothing was staged: these formulas refer to blank or label cells of the block being written. ' +
+            'Re-send write_range with each formula corrected (candidates are suggestions, not certainties). ' +
+            'If a formula is right as written, re-send it unchanged and it will be staged as is.',
+          diagnostics: unresolved,
+          ...(formulaCorrections.length > 0 ? { corrections: formulaCorrections } : {}),
+        });
+      }
     }
   }
 
@@ -697,7 +724,9 @@ async function executeToolCall(
           colsStaged,
           replacedPriorDraft,
           stagedOpsCount: pendingOps.length,
-          note: `Staged ${rowsStaged}×${colsStaged} table at ${op.range} into the pending change-set for this turn${replacedPriorDraft ? ` (replaced prior draft at ${startCellA1})` : ''}. All formulas are balanced and valid. For this turn, you may now call format_range once if needed, or reply to the user with a concise summary.`,
+          ...(formulaCorrections.length > 0 ? { corrections: formulaCorrections } : {}),
+          ...(confirmedFormulas.length > 0 ? { stagedAsWritten: confirmedFormulas.map((d) => d.cell) } : {}),
+          note: `Staged ${rowsStaged}×${colsStaged} table at ${op.range} into the pending change-set for this turn${replacedPriorDraft ? ` (replaced prior draft at ${startCellA1})` : ''}.${formulaCorrections.length > 0 ? ' Formula syntax was corrected as listed in corrections; references were not changed.' : ''} Formulas are checked only for syntax here; the user reviews their results before applying. For this turn, you may now call format_range once if needed, or reply to the user with a concise summary.`,
         });
       }
       pendingOps.push(op);
@@ -1284,73 +1313,136 @@ function tryExtractToolCallFromReasoning(
   return null;
 }
 
-/**
- * Auto-balances missing closing parentheses in formula strings emitted by
- * local models (e.g. `"=SUM(B7:B10"` -> `"=SUM(B7:B10)"`).
- */
-function balanceFormulaParens(formula: string): string {
-  const trimmed = formula.trim();
-  const withEq = trimmed.startsWith('=') ? trimmed : `=${trimmed}`;
-  let open = 0;
-  let inQuotes = false;
-  for (let i = 0; i < withEq.length; i++) {
-    const ch = withEq[i];
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-    } else if (!inQuotes) {
-      if (ch === '(') open++;
-      else if (ch === ')' && open > 0) open--;
-    }
-  }
-  return open > 0 ? `${withEq}${')'.repeat(open)}` : withEq;
+/** A syntax-only correction applied to a staged formula; reported back, never silent. */
+interface FormulaCorrection {
+  cell: string;
+  from: string;
+  to: string;
+  fix: string;
+}
+
+/** A reference that looks wrong but is left as written; the model must fix or confirm it. */
+interface FormulaDiagnostic {
+  cell: string;
+  formula: string;
+  issue: string;
+  candidates: string[];
 }
 
 /**
- * Normalizes `write_range` cells before validation and staging:
- * 1. Unwraps accidental 3-D single-row array nesting (`[[["Cash", 401900]]]` -> `[["Cash", 401900]]`).
- * 2. Auto-balances missing closing parentheses on `{ formula }` cells (`"=SUM(B7:B10"` -> `"=SUM(B7:B10)"`).
- * 3. Repairs off-by-one vertical `SUM(ColA:ColB)` and downstream subtotal references caused when
- *    models miscount blank spacer rows (`[""]`) inside a multi-section statement.
+ * Fixes only what is unambiguous syntax (the formula's meaning can't change):
+ * a missing leading `=`, `;` argument separators from non-en-US locales, and
+ * missing closing parentheses at the end.
  */
-function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[] {
-  const rows = rawCells.map((row) => {
+function fixFormulaSyntax(formula: string): { formula: string; fixes: string[] } {
+  const fixes: string[] = [];
+  let f = formula.trim();
+  if (!f.startsWith('=')) {
+    f = `=${f}`;
+    fixes.push('added the leading "="');
+  }
+  let out = '';
+  let open = 0;
+  let inQuotes = false;
+  let inArray = false; // `;` separates rows inside an array constant
+  let sawSemicolon = false;
+  for (const ch of f) {
+    if (ch === '"') inQuotes = !inQuotes;
+    else if (!inQuotes) {
+      if (ch === '{') inArray = true;
+      else if (ch === '}') inArray = false;
+      else if (ch === '(') open++;
+      else if (ch === ')' && open > 0) open--;
+      else if (ch === ';' && !inArray) {
+        out += ',';
+        sawSemicolon = true;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  if (sawSemicolon) fixes.push('replaced ";" argument separators with en-US ","');
+  if (open > 0 && !inQuotes) {
+    out += ')'.repeat(open);
+    fixes.push(`closed ${open} unbalanced parenthes${open === 1 ? 'is' : 'es'}`);
+  }
+  return { formula: out, fixes };
+}
+
+/**
+ * Normalizes `write_range` cells before validation and staging. It changes
+ * shape and syntax only, never what a formula refers to:
+ * 1. Unwraps accidental 3-D single-row array nesting (`[[["Cash", 401900]]]` -> `[["Cash", 401900]]`).
+ * 2. Applies {@link fixFormulaSyntax} to `{ formula }` cells, reporting each correction.
+ * 3. Flags references that point at blank or label cells of the block being
+ *    written, in the patterns local models get wrong: a vertical SUM shifted
+ *    off its number block by a miscounted spacer row (and refs to the
+ *    subtotals it shifted), and value columns referring to the label column
+ *    beside them. A formula whose references land on values is never flagged,
+ *    so a total of an earlier block, another column, an absolute or a
+ *    cross-sheet reference keeps its meaning.
+ */
+function repairWriteRangeCells(
+  rangeStr: string,
+  rawCells: unknown[],
+): { cells: unknown[]; corrections: FormulaCorrection[]; diagnostics: FormulaDiagnostic[] } {
+  let addr: ReturnType<typeof parseA1> | undefined;
+  try {
+    addr = parseA1(rangeStr);
+  } catch {
+    addr = undefined;
+  }
+  const cellName = (r: number, c: number): string =>
+    addr
+      ? formatA1({
+          sheet: addr.sheet,
+          startRow: addr.startRow + r,
+          startCol: addr.startCol + c,
+          endRow: addr.startRow + r,
+          endCol: addr.startCol + c,
+        })
+      : `row ${r + 1} col ${c + 1}`;
+
+  const corrections: FormulaCorrection[] = [];
+  const diagnostics: FormulaDiagnostic[] = [];
+  const rows = rawCells.map((row, r) => {
     let current = row;
     while (Array.isArray(current) && current.length === 1 && Array.isArray(current[0])) {
       current = current[0];
     }
     if (!Array.isArray(current)) return current;
-    return current.map((cell) => {
+    return current.map((cell, c) => {
       if (
         typeof cell === 'object' &&
         cell !== null &&
         'formula' in cell &&
         typeof (cell as { formula: unknown }).formula === 'string'
       ) {
-        return {
-          ...cell,
-          formula: balanceFormulaParens((cell as { formula: string }).formula),
-        };
+        const from = (cell as { formula: string }).formula;
+        const { formula, fixes } = fixFormulaSyntax(from);
+        if (fixes.length > 0) corrections.push({ cell: cellName(r, c), from, to: formula, fix: fixes.join('; ') });
+        return { ...cell, formula };
       }
       return cell;
     });
   });
+  if (!addr) return { cells: rows, corrections, diagnostics };
+  const start = addr;
 
-  let addr;
-  try {
-    addr = parseA1(rangeStr);
-  } catch {
-    return rows;
-  }
-
-  const baseRow = addr.startRow + 1; // 1-based sheet row for rows[0]
+  const baseRow = start.startRow + 1; // 1-based sheet row for rows[0]
   const maxCols = Math.max(0, ...rows.map((r) => (Array.isArray(r) ? r.length : 0)));
 
   const sumRangeRe =
     /^=\s*SUM\(\s*(\$?)([A-Za-z]{1,3})(\$?)(\d+)\s*:\s*(\$?)([A-Za-z]{1,3})(\$?)(\d+)\s*\)$/i;
   const singleRefRe = /^=\s*(\$?)([A-Za-z]{1,3})(\$?)(\d+)\s*$/i;
+  // Plain cell refs: not part of a range, a function name or a sheet-qualified ref.
+  const cellTokenRe = /(^|[^:A-Za-z0-9_!'])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:|\s*\(|[A-Za-z0-9_])/g;
+  const flag = (r: number, c: number, formula: string, issue: string, candidate: string) => {
+    if (candidate !== formula) diagnostics.push({ cell: cellName(r, c), formula, issue, candidates: [candidate] });
+  };
 
   for (let c = 0; c < maxCols; c++) {
-    const colLetter = indexToCol(addr.startCol + c).toUpperCase();
+    const colLetter = indexToCol(start.startCol + c).toUpperCase();
     const getCellAt = (colIdx: number, sheetRow: number): unknown => {
       const idx = sheetRow - baseRow;
       if (idx < 0 || idx >= rows.length) return undefined;
@@ -1375,7 +1467,21 @@ function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[]
       const v = getCell(sheetRow);
       return v === undefined || v === null || v === '';
     };
+    /** `col` is another column of this block holding no value on `refRow`, where this column holds one. */
+    const isLabelColRef = (col: string, refRow: number, actualRow: number): boolean => {
+      const otherColOffset = colToIndex(col) - start.startCol;
+      return (
+        col !== colLetter &&
+        otherColOffset >= 0 &&
+        otherColOffset < maxCols &&
+        refRow < actualRow &&
+        !isNumericCellAt(otherColOffset, refRow) &&
+        !isFormulaCellAt(otherColOffset, refRow) &&
+        (isNumericCell(refRow) || isFormulaCell(refRow))
+      );
+    };
 
+    // Where the model believed each flagged subtotal sat (key), and where it is (value).
     const mentalToActualSubtotalRow = new Map<number, number>();
     const passThroughSubtotalRow = new Map<number, number>();
     const summedDetailRows = new Set<number>();
@@ -1384,191 +1490,137 @@ function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[]
       const actualRow = baseRow + r;
       const rowArr = rows[r];
       if (!Array.isArray(rowArr) || !isFormulaCell(actualRow)) continue;
-      let formulaObj = rowArr[c] as { formula: string };
-      let formula = formulaObj.formula;
+      const formula = (rowArr[c] as { formula: string }).formula;
 
-      // 0. In side-by-side / multi-column tables (e.g. Assets in A:B, spacer in C, Liabilities in D:E),
-      //    models sometimes write =SUM(D5:D6) or =D7+D12 inside value column E (referencing the label column D).
-      //    If all referenced rows in that other column are strings/empty while the same rows in column `c` are
-      //    numeric/formula cells, rewrite the column letter to `colLetter`.
-      const preSumMatch = sumRangeRe.exec(formula);
-      if (
-        preSumMatch &&
-        preSumMatch[2]!.toUpperCase() === preSumMatch[6]!.toUpperCase() &&
-        preSumMatch[2]!.toUpperCase() !== colLetter
-      ) {
-        const otherColOffset = colToIndex(preSumMatch[2]!.toUpperCase()) - addr.startCol;
-        const sRow = parseInt(preSumMatch[4]!, 10);
-        const eRow = parseInt(preSumMatch[8]!, 10);
-        if (otherColOffset >= 0 && otherColOffset < maxCols && sRow <= eRow && eRow < actualRow) {
-          const rowSpan = Array.from({ length: eRow - sRow + 1 }, (_, i) => sRow + i);
-          const otherHasNumericOrFormula = rowSpan.some(
-            (k) => isNumericCellAt(otherColOffset, k) || isFormulaCellAt(otherColOffset, k),
-          );
-          const currentHasNumeric = rowSpan.some((k) => isNumericCell(k));
-          if (!otherHasNumericOrFormula && currentHasNumeric) {
-            formula = `=SUM(${preSumMatch[1]}${colLetter}${preSumMatch[3]}${sRow}:${preSumMatch[5]}${colLetter}${preSumMatch[7]}${eRow})`;
-            formulaObj = { formula };
-            rowArr[c] = formulaObj;
-          }
-        }
-      } else if (!preSumMatch) {
-        const refTokenRe = /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:|\s*\()/g;
-        let hasWrongLabelColRef = false;
-        let rm: RegExpExecArray | null;
-        while ((rm = refTokenRe.exec(formula)) !== null) {
-          const refCol = rm[3]!.toUpperCase();
-          if (refCol === colLetter) continue;
-          const otherColOffset = colToIndex(refCol) - addr.startCol;
-          const refRow = parseInt(rm[5]!, 10);
-          if (
-            otherColOffset >= 0 &&
-            otherColOffset < maxCols &&
-            refRow < actualRow &&
-            !isNumericCellAt(otherColOffset, refRow) &&
-            !isFormulaCellAt(otherColOffset, refRow) &&
-            (isNumericCell(refRow) || isFormulaCell(refRow))
-          ) {
-            hasWrongLabelColRef = true;
-            break;
-          }
-        }
-        if (hasWrongLabelColRef) {
-          formula = formula.replace(
-            /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:|\s*\()/g,
-            (full, prefix: string, d1: string, col: string, d2: string, rowDigits: string) => {
-              const refCol = col.toUpperCase();
-              if (refCol === colLetter) return full;
-              const otherColOffset = colToIndex(refCol) - addr.startCol;
-              const refRow = parseInt(rowDigits, 10);
-              if (
-                otherColOffset >= 0 &&
-                otherColOffset < maxCols &&
-                refRow < actualRow &&
-                !isNumericCellAt(otherColOffset, refRow) &&
-                !isFormulaCellAt(otherColOffset, refRow) &&
-                (isNumericCell(refRow) || isFormulaCell(refRow))
-              ) {
-                return `${prefix}${d1}${colLetter}${d2}${rowDigits}`;
-              }
-              return full;
-            },
-          );
-          formulaObj = { formula };
-          rowArr[c] = formulaObj;
-        }
-      }
-
-      // 1. Check vertical =SUM(Col<sRow>:Col<eRow>)
+      // Side-by-side tables (e.g. Assets in A:B, Liabilities in D:E): a total in
+      // value column E that sums label column D.
       const sumMatch = sumRangeRe.exec(formula);
-      if (
-        sumMatch &&
-        sumMatch[2]!.toUpperCase() === colLetter &&
-        sumMatch[6]!.toUpperCase() === colLetter
-      ) {
+      const sumCol = sumMatch?.[2]!.toUpperCase();
+      if (sumMatch && sumCol === sumMatch[6]!.toUpperCase() && sumCol !== colLetter) {
+        const otherColOffset = colToIndex(sumCol!) - start.startCol;
         const sRow = parseInt(sumMatch[4]!, 10);
         const eRow = parseInt(sumMatch[8]!, 10);
-
-        const numEnd = actualRow - 1;
-        let numStart = numEnd + 1;
-        while (numStart - 1 >= baseRow && isNumericCell(numStart - 1)) {
-          numStart--;
-        }
-
-        if (numStart <= numEnd) {
-          if (sRow === numStart && eRow === numEnd) {
-            for (let k = numStart; k <= numEnd; k++) summedDetailRows.add(k);
-          } else if (
-            sRow <= eRow &&
-            eRow < actualRow &&
-            eRow - sRow === numEnd - numStart &&
-            Math.abs(numEnd - eRow) <= 5 &&
-            (eRow < numEnd ||
-              Array.from({ length: eRow - sRow + 1 }, (_, i) => sRow + i).some((k) =>
-                isEmptyCell(k),
-              ))
-          ) {
-            rowArr[c] = {
-              formula: `=SUM(${sumMatch[1]}${colLetter}${sumMatch[3]}${numStart}:${sumMatch[5]}${colLetter}${sumMatch[7]}${numEnd})`,
-            };
-            for (let k = numStart; k <= numEnd; k++) summedDetailRows.add(k);
-            // The model thought the detail block ended at eRow, so it thought this subtotal row was at eRow + 1
-            mentalToActualSubtotalRow.set(eRow + 1, actualRow);
+        if (otherColOffset >= 0 && otherColOffset < maxCols && sRow <= eRow && eRow < actualRow) {
+          const rowSpan = Array.from({ length: eRow - sRow + 1 }, (_, i) => sRow + i);
+          const otherHasValue = rowSpan.some(
+            (k) => isNumericCellAt(otherColOffset, k) || isFormulaCellAt(otherColOffset, k),
+          );
+          if (!otherHasValue && rowSpan.some((k) => isNumericCell(k))) {
+            flag(
+              r,
+              c,
+              formula,
+              `sums ${sumCol}${sRow}:${sumCol}${eRow}, which holds only labels or blanks in this block, while column ${colLetter} holds the numbers on those rows`,
+              `=SUM(${sumMatch[1]}${colLetter}${sumMatch[3]}${sRow}:${sumMatch[5]}${colLetter}${sumMatch[7]}${eRow})`,
+            );
           }
         }
         continue;
       }
+      const isPlainArithmetic = !formula.includes('"') && !/[A-Za-z_]\w*\s*\(/.test(formula);
+      if (!sumMatch && isPlainArithmetic) {
+        const labelRefs = [...formula.matchAll(cellTokenRe)].filter((m) =>
+          isLabelColRef(m[3]!.toUpperCase(), parseInt(m[5]!, 10), actualRow),
+        );
+        if (labelRefs.length > 0) {
+          flag(
+            r,
+            c,
+            formula,
+            `refers to ${labelRefs.map((m) => `${m[3]}${m[5]}`).join(', ')}, holding a label or blank in this block, while column ${colLetter} holds the value on that row`,
+            formula.replace(cellTokenRe, (full, prefix: string, d1: string, col: string, d2: string, rowDigits: string) =>
+              isLabelColRef(col.toUpperCase(), parseInt(rowDigits, 10), actualRow)
+                ? `${prefix}${d1}${colLetter}${d2}${rowDigits}`
+                : full,
+            ),
+          );
+          continue;
+        }
+      }
 
-      // 2. Check single-cell pass-through subtotal =Col<refRow> (e.g. =B24 on TOTAL LIABILITIES)
+      // A vertical SUM as long as the number block right above it, but shifted
+      // onto a blank row: the signature of a miscounted spacer row.
+      if (sumMatch) {
+        const sRow = parseInt(sumMatch[4]!, 10);
+        const eRow = parseInt(sumMatch[8]!, 10);
+        const numEnd = actualRow - 1;
+        let numStart = numEnd + 1;
+        while (numStart - 1 >= baseRow && isNumericCell(numStart - 1)) numStart--;
+        if (numStart > numEnd) continue;
+        if (sRow === numStart && eRow === numEnd) {
+          for (let k = numStart; k <= numEnd; k++) summedDetailRows.add(k);
+        } else if (
+          sRow <= eRow &&
+          eRow < actualRow &&
+          eRow - sRow === numEnd - numStart &&
+          Math.abs(numEnd - eRow) <= 5 &&
+          Array.from({ length: eRow - sRow + 1 }, (_, i) => sRow + i).some((k) => isEmptyCell(k))
+        ) {
+          flag(
+            r,
+            c,
+            formula,
+            `sums ${colLetter}${sRow}:${colLetter}${eRow}, which includes blank rows of this block; the ${numEnd - numStart + 1} numbers directly above are ${colLetter}${numStart}:${colLetter}${numEnd}`,
+            `=SUM(${sumMatch[1]}${colLetter}${sumMatch[3]}${numStart}:${sumMatch[5]}${colLetter}${sumMatch[7]}${numEnd})`,
+          );
+          for (let k = numStart; k <= numEnd; k++) summedDetailRows.add(k);
+          // The model thought the detail block ended at eRow, so it thought this subtotal row was at eRow + 1.
+          mentalToActualSubtotalRow.set(eRow + 1, actualRow);
+        }
+        continue;
+      }
+
+      // Refs to where the model believed a flagged subtotal was (e.g. =B24 for TOTAL LIABILITIES).
+      const shiftedTo = (refRow: number): number | undefined => {
+        const mapped = mentalToActualSubtotalRow.get(refRow);
+        return mapped !== undefined &&
+          mapped < actualRow &&
+          (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
+          isFormulaCell(mapped)
+          ? mapped
+          : undefined;
+      };
       const singleMatch = singleRefRe.exec(formula);
       if (singleMatch && singleMatch[2]!.toUpperCase() === colLetter) {
         const refRow = parseInt(singleMatch[4]!, 10);
-        const mappedRow = mentalToActualSubtotalRow.get(refRow);
-        if (
-          mappedRow !== undefined &&
-          mappedRow < actualRow &&
-          (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
-          isFormulaCell(mappedRow)
-        ) {
-          rowArr[c] = {
-            formula: `=${singleMatch[1]}${colLetter}${singleMatch[3]}${mappedRow}`,
-          };
-          passThroughSubtotalRow.set(mappedRow, actualRow);
+        const mapped = shiftedTo(refRow);
+        if (mapped !== undefined) {
+          flag(
+            r,
+            c,
+            formula,
+            `refers to ${colLetter}${refRow}, where a subtotal flagged above was expected to be; it is at ${colLetter}${mapped}`,
+            `=${singleMatch[1]}${colLetter}${singleMatch[3]}${mapped}`,
+          );
+          passThroughSubtotalRow.set(mapped, actualRow);
         } else if (isFormulaCell(refRow) && refRow < actualRow) {
           passThroughSubtotalRow.set(refRow, actualRow);
         }
         continue;
       }
-
-      // 3. Check multi-cell subtotal formulas (e.g. =B25+B30) when earlier subtotals shifted
       if (mentalToActualSubtotalRow.size > 0) {
-        const cellTokenRe = /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:)/g;
-        let hasShiftedSubtotalRef = false;
-        let m: RegExpExecArray | null;
-        while ((m = cellTokenRe.exec(formula)) !== null) {
-          if (m[3]!.toUpperCase() !== colLetter) continue;
-          const refRow = parseInt(m[5]!, 10);
-          const mapped = mentalToActualSubtotalRow.get(refRow);
-          if (
-            mapped !== undefined &&
-            mapped < actualRow &&
-            (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
-            isFormulaCell(mapped)
-          ) {
-            hasShiftedSubtotalRef = true;
-            break;
-          }
-        }
-
-        if (hasShiftedSubtotalRef) {
-          const repaired = formula.replace(
-            /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:)/g,
-            (full, prefix: string, d1: string, col: string, d2: string, rowDigits: string) => {
+        const shifted = [...formula.matchAll(cellTokenRe)].filter(
+          (m) => m[3]!.toUpperCase() === colLetter && shiftedTo(parseInt(m[5]!, 10)) !== undefined,
+        );
+        if (shifted.length > 0) {
+          flag(
+            r,
+            c,
+            formula,
+            `refers to ${shifted.map((m) => `${m[3]}${m[5]}`).join(', ')}, where subtotals flagged above were expected to be`,
+            formula.replace(cellTokenRe, (full, prefix: string, d1: string, col: string, d2: string, rowDigits: string) => {
               if (col.toUpperCase() !== colLetter) return full;
               const refRow = parseInt(rowDigits, 10);
-              const mapped = mentalToActualSubtotalRow.get(refRow);
-              if (
-                mapped !== undefined &&
-                mapped < actualRow &&
-                (isEmptyCell(refRow) || summedDetailRows.has(refRow)) &&
-                isFormulaCell(mapped)
-              ) {
-                return `${prefix}${d1}${colLetter}${d2}${mapped}`;
-              }
-              const passThrough = passThroughSubtotalRow.get(refRow);
-              if (passThrough !== undefined && passThrough < actualRow) {
-                return `${prefix}${d1}${colLetter}${d2}${passThrough}`;
-              }
-              return full;
-            },
+              const target = shiftedTo(refRow) ?? passThroughSubtotalRow.get(refRow);
+              return target !== undefined && target < actualRow ? `${prefix}${d1}${colLetter}${d2}${target}` : full;
+            }),
           );
-          rowArr[c] = { formula: repaired };
         }
       }
     }
   }
 
-  return rows;
+  return { cells: rows, corrections, diagnostics };
 }
 
 export { MAX_REPAIR_ATTEMPTS_PER_CALL };

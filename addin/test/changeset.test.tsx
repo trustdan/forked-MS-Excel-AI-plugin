@@ -205,6 +205,25 @@ describe('officeBridge sheet targeting', () => {
     );
   });
 
+  it('reads error metadata from valueTypes, so text starting with "#" is not an error', async () => {
+    const { readRange } = await import('../src/officeBridge.js');
+    const { worksheets } = installExcel(['Payroll']);
+    worksheets[0]!.getRange.mockImplementation(() => ({
+      values: [['#DIV/0!', '#SKU', '#N/A']],
+      formulas: [['=1/0', '#SKU', '#N/A']],
+      valueTypes: [['Error', 'String', 'Error']],
+      load: vi.fn(),
+    }));
+
+    expect(await readRange('Payroll!A1:C1')).toEqual([
+      [
+        { value: '#DIV/0!', formula: '=1/0', error: '#DIV/0!' },
+        { value: '#SKU' },
+        { value: '#N/A', error: '#N/A' },
+      ],
+    ]);
+  });
+
   it('matches sheet names case-insensitively and writes to exactly that sheet', async () => {
     const { applyOps } = await import('../src/officeBridge.js');
     const { written } = installExcel(['Payroll', '2025 Report']);

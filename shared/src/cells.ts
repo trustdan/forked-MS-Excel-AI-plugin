@@ -10,10 +10,44 @@ export type CellScalar = string | number | boolean | null;
 
 /** A cell as transported over the protocol. */
 export interface CellData {
-  /** Computed value. Errors are encoded as strings beginning with "#". */
+  /** Computed value. An error value shows as its code (e.g. "#DIV/0!"); see `error`. */
   value: CellScalar;
   /** Canonical en-US formula including leading "=", if the cell has one. */
   formula?: string;
+  /**
+   * Set only when the cell holds an Excel error value, to its code. Text that
+   * merely starts with "#" (e.g. "#SKU") is not an error and leaves this unset.
+   */
+  error?: string;
+}
+
+/**
+ * Excel's error codes, plus the emulator's `#CYCLE!`. Excel turns these
+ * strings into error values when they are entered as constants, so a cell
+ * whose value is one of them holds an error; any other "#…" text is text.
+ */
+export const EXCEL_ERROR_CODES: ReadonlySet<string> = new Set([
+  '#NULL!',
+  '#DIV/0!',
+  '#VALUE!',
+  '#REF!',
+  '#NAME?',
+  '#NUM!',
+  '#N/A',
+  '#GETTING_DATA',
+  '#SPILL!',
+  '#CALC!',
+  '#FIELD!',
+  '#CONNECT!',
+  '#BLOCKED!',
+  '#UNKNOWN!',
+  '#BUSY!',
+  '#PYTHON!',
+  '#CYCLE!',
+]);
+
+export function isExcelErrorCode(v: unknown): boolean {
+  return typeof v === 'string' && EXCEL_ERROR_CODES.has(v);
 }
 
 export interface RangeAddress {

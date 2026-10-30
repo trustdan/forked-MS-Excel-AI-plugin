@@ -129,9 +129,9 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 | ID | Priority | Epic | Phase | Status |
 | --- | --- | --- | --- | --- |
 | F1 | P1 | E1 | 1 | done |
-| F2 | P1 | E3 | 2 | open |
+| F2 | P1 | E3 | 2 | done |
 | F3 | P1 | E2a | 1 | done |
-| F4 | P1 | E3 | 2 | open |
+| F4 | P1 | E3 | 2 | done |
 | F5 | P1 | E0 → E4 | 0 / 3 | open |
 | F6 | P1 | E0 → E5 | 0 / 3 | open |
 | F7 | P2 | E5 | 3 | open |

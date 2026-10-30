@@ -1,4 +1,4 @@
-import { colToIndex, type CellScalar, type RangeAddress } from '@excelai/shared';
+import { colToIndex, isExcelErrorCode, type CellScalar, type RangeAddress } from '@excelai/shared';
 
 /**
  * A small, deterministic evaluator for canonical en-US Excel formulas.
@@ -333,7 +333,7 @@ function toNumber(v: CellScalar): number {
   if (typeof v === 'number') return v;
   if (typeof v === 'boolean') return v ? 1 : 0;
   if (typeof v === 'string') {
-    if (v.startsWith('#')) throw new FormulaError(v as EvalError);
+    if (isExcelErrorCode(v)) throw new FormulaError(v as EvalError);
     if (v.trim() === '') return 0;
     const n = Number(v);
     if (Number.isNaN(n)) throw new FormulaError('#VALUE!');
@@ -349,7 +349,7 @@ function toText(v: CellScalar): string {
 }
 
 function propagate(v: CellScalar): CellScalar {
-  if (typeof v === 'string' && v.startsWith('#')) throw new FormulaError(v as EvalError);
+  if (isExcelErrorCode(v)) throw new FormulaError(v as EvalError);
   return v;
 }
 
@@ -357,7 +357,7 @@ function flattenNumeric(values: CellScalar[][]): number[] {
   const out: number[] = [];
   for (const row of values) {
     for (const v of row) {
-      if (typeof v === 'string' && v.startsWith('#')) throw new FormulaError(v as EvalError);
+      if (isExcelErrorCode(v)) throw new FormulaError(v as EvalError);
       if (typeof v === 'number') out.push(v);
     }
   }

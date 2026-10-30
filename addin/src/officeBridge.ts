@@ -42,7 +42,7 @@ export async function readRange(rangeRef: string): Promise<CellData[][]> {
   return Excel.run(async (context) => {
     const resolver = await loadWorksheetResolver(context);
     const range = getRange(rangeRef, resolver);
-    range.load(['values', 'formulas']);
+    range.load(['values', 'formulas', 'valueTypes']);
     await context.sync();
 
     const out: CellData[][] = [];
@@ -52,7 +52,13 @@ export async function readRange(rangeRef: string): Promise<CellData[][]> {
         const value = range.values[r]![c] as CellData['value'];
         const formula = range.formulas[r]![c];
         const isFormula = typeof formula === 'string' && formula.startsWith('=');
-        row.push({ value, ...(isFormula ? { formula } : {}) });
+        // valueTypes, not a "#" prefix, tells an error value from text such as "#SKU".
+        const isError = range.valueTypes[r]![c] === 'Error';
+        row.push({
+          value,
+          ...(isFormula ? { formula } : {}),
+          ...(isError ? { error: String(value) } : {}),
+        });
       }
       out.push(row);
     }
