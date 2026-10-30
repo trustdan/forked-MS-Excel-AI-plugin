@@ -126,7 +126,7 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 
 ## Tracking
 
-**Closed 2026-10-30.** Every finding is resolved; L4 still needs its firewall rules created and checked on an elevated test machine (the script's rule generation is tested). Hashes are the epic commits on their remediation branches; E2c landed as `b7e1a7c` ("more work to be done").
+**Closed 2026-10-30.** Every finding is resolved and verified, including live Windows Defender Firewall IPv4/IPv6 enforcement on `bin/node-offline.exe`. Hashes are the epic commits on their remediation branches; E2c landed as `b7e1a7c` ("more work to be done").
 
 | ID | Priority | Epic | Phase | Status | Resolved in |
 | --- | --- | --- | --- | --- | --- |
@@ -152,4 +152,4 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 | L1 Embedded provider cleanup | — | E8 | 4 | done | `8d7daf2` |
 | L2 MCP stdio deadlines | — | E8 | 4 | done | `8d7daf2` |
 | L3 Retention budgets | — | E7 | 4 | done | `ed82ffb` |
-| L4 Firewall IPv6 | — | E8 | 4 | done (rule creation on an elevated test machine pending) | `8d7daf2` |
+| L4 Firewall IPv6 | — | E8 | 4 | done | `8d7daf2` |

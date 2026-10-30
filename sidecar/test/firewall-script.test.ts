@@ -1,11 +1,32 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { isIPv4, isIPv6 } from 'node:net';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const scriptPath = join(__dirname, '..', '..', 'scripts', 'lockdown-firewall.ps1');
+const repoRoot = join(__dirname, '..', '..');
+const scriptPath = join(repoRoot, 'scripts', 'lockdown-firewall.ps1');
+const nodeOfflinePath = join(repoRoot, 'bin', 'node-offline.exe');
 const source = readFileSync(scriptPath, 'utf8');
+
+function hasInstalledFirewallRule(): boolean {
+  if (process.platform !== 'win32' || !existsSync(nodeOfflinePath)) return false;
+  try {
+    const out = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        "(Get-NetFirewallRule -DisplayName 'ExcelAI-Node-Offline-Block' -ErrorAction SilentlyContinue | Measure-Object).Count",
+      ],
+      { encoding: 'utf8' },
+    );
+    return Number(out.trim()) > 0;
+  } catch {
+    return false;
+  }
+}
 
 function blockedRanges(): Array<[string, string]> {
   const block = /\$BlockedRanges = @\(([\s\S]*?)\)/.exec(source)?.[1] ?? '';
@@ -71,4 +92,46 @@ describe('lockdown-firewall.ps1 (L4)', () => {
   it('says that child MCP binaries need their own rules', () => {
     expect(source).toMatch(/MCP server[\s\S]*needs its own outbound block rule/);
   });
+
+  it.skipIf(!hasInstalledFirewallRule())(
+    'enforces loopback-only IPv4 and IPv6 on bin/node-offline.exe when the rule is installed',
+    () => {
+      const probeScript = `
+        import net from 'node:net';
+        async function listen(host) {
+          const srv = net.createServer((s) => { s.on('error', () => {}); s.end('ok'); });
+          await new Promise((res, rej) => { srv.once('error', rej); srv.listen(0, host, res); });
+          return srv;
+        }
+        function probe(host, port) {
+          return new Promise((res) => {
+            const sock = net.connect({ host, port });
+            const t = setTimeout(() => { sock.destroy(); res('TIMEOUT'); }, 1500);
+            sock.once('connect', () => { clearTimeout(t); sock.end(); res('CONNECTED'); });
+            sock.once('error', (err) => { clearTimeout(t); res(err.code || err.message); });
+          });
+        }
+        const s4 = await listen('127.0.0.1');
+        const s6 = await listen('::1');
+        const out = {
+          loopbackV4: await probe('127.0.0.1', s4.address().port),
+          loopbackV6: await probe('::1', s6.address().port),
+          externalV4: await probe('1.1.1.1', 443),
+          externalV6: await probe('2606:4700:4700::1111', 443),
+        };
+        s4.close();
+        s6.close();
+        console.log(JSON.stringify(out));
+      `;
+      const out = execFileSync(nodeOfflinePath, ['--input-type=module', '-e', probeScript], {
+        encoding: 'utf8',
+      });
+      expect(JSON.parse(out.trim())).toEqual({
+        loopbackV4: 'CONNECTED',
+        loopbackV6: 'CONNECTED',
+        externalV4: 'EACCES',
+        externalV6: 'EACCES',
+      });
+    },
+  );
 });

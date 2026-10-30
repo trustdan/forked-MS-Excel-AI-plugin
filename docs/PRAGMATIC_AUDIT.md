@@ -212,4 +212,4 @@ Every finding above was fixed in the remediation epics of [REMEDIATION_PLAN.md](
 | Embedded lifecycle | `8d7daf2` (E8) |
 | Stdio MCP deadlines | `8d7daf2` (E8) |
 | Retention budgets | `ed82ffb` (E7) |
-| Firewall IPv6 | `8d7daf2` (E8); rule creation on an elevated test machine is still unverified |
+| Firewall IPv6 | `8d7daf2` (E8) |
