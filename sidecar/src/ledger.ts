@@ -1,4 +1,4 @@
-import type { Db } from './db.js';
+import { DEFAULT_RETENTION, pruneLedger, type Db, type RetentionLimits } from './db.js';
 
 export interface LedgerSummary {
   totalCalls: number;
@@ -7,9 +7,15 @@ export interface LedgerSummary {
   byFeature: { feature: string; calls: number; inputTokens: number; outputTokens: number }[];
 }
 
-/** Cost & audit ledger: every model call is recorded locally. */
+/**
+ * Cost & audit ledger: every model call is recorded locally. Totals cover the
+ * retained window ({@link RetentionLimits}), not the whole install lifetime.
+ */
 export class Ledger {
-  constructor(private readonly db: Db) {}
+  constructor(
+    private readonly db: Db,
+    private readonly limits: RetentionLimits = DEFAULT_RETENTION,
+  ) {}
 
   record(entry: {
     provider: string;
@@ -30,6 +36,7 @@ export class Ledger {
         entry.inputTokens,
         entry.outputTokens,
       );
+    pruneLedger(this.db, this.limits);
   }
 
   summary(): LedgerSummary {

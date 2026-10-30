@@ -68,4 +68,32 @@ describe('ModelsScreen Component', () => {
       expect(screen.getByText(/1 models available/i)).toBeDefined();
     });
   });
+
+  it('shows a settings-file problem and dismisses it', async () => {
+    let problem: object | undefined = {
+      kind: 'unreadable',
+      detail: 'not valid JSON',
+      preservedAs: 'C:/Users/me/.excelai/settings.json.corrupt-2026-10-30T12-00-00-000Z',
+      at: '2026-10-30T12:00:00.000Z',
+    };
+    const mockApi = vi.spyOn(connection, 'api').mockImplementation(async (path, init) => {
+      if (path === '/api/settings/providers' && !init?.method) {
+        return { providers: [], activeProviderId: null, ...(problem ? { settingsProblem: problem } : {}) };
+      }
+      if (path === '/api/settings/problem' && init?.method === 'DELETE') {
+        problem = undefined;
+        return { ok: true };
+      }
+      return {};
+    });
+
+    render(<ModelsScreen onChanged={vi.fn()} />);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('unreadable');
+    expect(alert.textContent).toContain('settings.json.corrupt-2026-10-30T12-00-00-000Z');
+
+    fireEvent.click(screen.getByRole('button', { name: /Dismiss/i }));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    expect(mockApi).toHaveBeenCalledWith('/api/settings/problem', { method: 'DELETE' });
+  });
 });

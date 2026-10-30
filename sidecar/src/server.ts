@@ -9,15 +9,19 @@ import { z } from 'zod';
 import { Auth } from './auth.js';
 import {
   activeProvider,
+  clearSettingsProblem,
   loadSettings,
+  providerIdentity,
   redactProvider,
   saveSettings,
+  settingsProblem,
+  SettingsUnavailableError,
   type StoredProvider,
 } from './config.js';
 import type { Db } from './db.js';
 import { Ledger } from './ledger.js';
 import { MemoryStore } from './memory/store.js';
-import { FunctionEngine } from './functions/batch.js';
+import { FunctionEngine, FunctionQueueFullError } from './functions/batch.js';
 import { anthropicUrl, createProvider, ProviderError, getModelsDir, listLocalGgufModels, type Provider } from './providers/index.js';
 import { BridgeExecutor } from './bridge.js';
 import { Session } from './session.js';
@@ -95,11 +99,18 @@ export async function startServer(options: {
   const functions = new FunctionEngine(db);
   const mcpManager = new McpManager();
 
-  const initialSettings = loadSettings();
-  await mcpManager.sync(initialSettings.mcpServers, initialSettings.approvedPaths);
+  try {
+    const initialSettings = loadSettings();
+    await mcpManager.sync(initialSettings.mcpServers, initialSettings.approvedPaths);
+  } catch (e) {
+    // Keep serving so the taskpane can show the problem; every settings
+    // route reports the same error until the file is readable again.
+    if (!(e instanceof SettingsUnavailableError)) throw e;
+    console.error(`[settings] ${e.message}`);
+  }
 
-  let cachedProvider: { provider: Provider; fingerprint: string } | null = null;
-  const getProvider = (): Provider => {
+  let cachedProvider: { provider: Provider; identity: string; fingerprint: string } | null = null;
+  const getActiveProvider = (): { provider: Provider; identity: string } => {
     const active = activeProvider(loadSettings()) ?? {
       id: 'default-lm-studio',
       kind: 'openai-compatible',
@@ -109,10 +120,11 @@ export async function startServer(options: {
     };
     const fingerprint = JSON.stringify(active);
     if (!cachedProvider || cachedProvider.fingerprint !== fingerprint) {
-      cachedProvider = { provider: createProvider(active), fingerprint };
+      cachedProvider = { provider: createProvider(active), identity: providerIdentity(active), fingerprint };
     }
-    return cachedProvider.provider;
+    return cachedProvider;
   };
+  const getProvider = (): Provider => getActiveProvider().provider;
 
   // Optional TLS (e.g. office-addin-dev-certs for hosts that require
   // https://localhost): set EXCELAI_TLS_CERT and EXCELAI_TLS_KEY.
@@ -176,10 +188,17 @@ export async function startServer(options: {
 
       if (url.pathname === '/api/settings/providers' && req.method === 'GET') {
         const settings = loadSettings();
+        const problem = settingsProblem();
         sendJson(res, 200, {
           providers: settings.providers.map(redactProvider),
           activeProviderId: settings.activeProviderId,
+          ...(problem ? { settingsProblem: problem } : {}),
         });
+        return;
+      }
+      if (url.pathname === '/api/settings/problem' && req.method === 'DELETE') {
+        clearSettingsProblem();
+        sendJson(res, 200, { ok: true });
         return;
       }
       if (url.pathname === '/api/settings/providers' && req.method === 'POST') {
@@ -304,9 +323,10 @@ export async function startServer(options: {
           }
         });
         try {
-          const provider = getProvider();
+          const { provider, identity } = getActiveProvider();
           const value = await functions.run(
             provider,
+            identity,
             parsed.data,
             (usage) =>
               ledger.record({ provider: provider.id, model: provider.model, feature: 'functions', ...usage }),
@@ -321,6 +341,8 @@ export async function startServer(options: {
             if (!res.writableEnded) {
               sendJson(res, 499, { error: 'Calculation canceled' });
             }
+          } else if (e instanceof FunctionQueueFullError) {
+            sendJson(res, 503, { error: e.message });
           } else {
             sendJson(res, 502, { error: e instanceof Error ? e.message : 'Function failed' });
           }

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Db } from '../db.js';
+import { DEFAULT_RETENTION, pruneFnCache, type Db, type RetentionLimits } from '../db.js';
 import type { Provider } from '../providers/types.js';
 import { withRetry } from '../providers/index.js';
 
@@ -13,23 +13,58 @@ export interface FunctionRequest {
   targetLang?: string;
 }
 
+// Part of every cache key, so changing either starts fresh entries.
+const CALL_PARAMS = { temperature: 0, maxTokens: 1024 };
+
+export interface FunctionEngineOptions {
+  concurrency?: number;
+  /** Calls allowed to wait for a slot; more are refused with {@link FunctionQueueFullError}. */
+  maxQueued?: number;
+  /** Longest a call may wait for a slot before it is refused. */
+  maxQueueWaitMs?: number;
+  retention?: RetentionLimits;
+}
+
+/** Refused before reaching the model: the wait queue is full, or the call waited too long. */
+export class FunctionQueueFullError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FunctionQueueFullError';
+  }
+}
+
 /**
  * Batch engine for the =AI() custom-function family: persistent caching
  * (recalc storms never re-bill), in-flight deduplication, and a global
  * concurrency limit so a column fill cannot stampede a provider.
+ *
+ * Cached results are namespaced by the caller's provider identity (saved
+ * config id plus a non-secret fingerprint, see `providerIdentity`) and keyed
+ * on the exact prompt sent, so switching configurations never returns another
+ * configuration's answer and editing a prompt template invalidates old entries.
  */
 export class FunctionEngine {
   private inFlight = new Map<string, Promise<string>>();
   private active = 0;
   private queue: (() => void)[] = [];
+  private readonly concurrency: number;
+  private readonly maxQueued: number;
+  private readonly maxQueueWaitMs: number;
+  private readonly retention: RetentionLimits;
 
   constructor(
     private readonly db: Db,
-    private readonly concurrency = 4,
-  ) {}
+    options: FunctionEngineOptions = {},
+  ) {
+    this.concurrency = options.concurrency ?? 4;
+    this.maxQueued = options.maxQueued ?? 256;
+    this.maxQueueWaitMs = options.maxQueueWaitMs ?? 10 * 60_000;
+    this.retention = options.retention ?? DEFAULT_RETENTION;
+  }
 
   async run(
     provider: Provider,
+    providerIdentity: string,
     req: FunctionRequest,
     onUsage?: (u: { inputTokens: number; outputTokens: number }) => void,
     abortSignal?: AbortSignal,
@@ -39,7 +74,8 @@ export class FunctionEngine {
       err.name = 'AbortError';
       throw err;
     }
-    const key = cacheKey(provider, req);
+    const { system, user } = buildPrompt(req);
+    const key = cacheKey(providerIdentity, req, system, user);
 
     const cached = this.db.prepare('SELECT value FROM fn_cache WHERE key = ?').get(key) as
       | { value: string }
@@ -55,15 +91,13 @@ export class FunctionEngine {
         err.name = 'AbortError';
         throw err;
       }
-      const { system, user } = buildPrompt(req);
       const response = await withRetry(() =>
         provider.chat({
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: user },
           ],
-          temperature: 0,
-          maxTokens: 1024,
+          ...CALL_PARAMS,
           abortSignal,
         }),
       );
@@ -80,6 +114,7 @@ export class FunctionEngine {
       this.db
         .prepare('INSERT OR REPLACE INTO fn_cache (key, value, created_at) VALUES (?, ?, ?)')
         .run(key, value, new Date().toISOString());
+      pruneFnCache(this.db, this.retention);
       return value;
     }, abortSignal);
 
@@ -98,16 +133,29 @@ export class FunctionEngine {
       throw err;
     }
     if (this.active >= this.concurrency) {
+      if (this.queue.length >= this.maxQueued) {
+        throw new FunctionQueueFullError(`Too many AI function calls waiting (${this.maxQueued}); recalculate later`);
+      }
       await new Promise<void>((resolve, reject) => {
         let resume: () => void;
-        const onAbort = (): void => {
+        const leave = (err: Error): void => {
+          clearTimeout(timer);
           const idx = this.queue.indexOf(resume);
           if (idx >= 0) this.queue.splice(idx, 1);
-          const err = new Error('Function call was aborted');
-          err.name = 'AbortError';
+          abortSignal?.removeEventListener('abort', onAbort);
           reject(err);
         };
+        const onAbort = (): void => {
+          const err = new Error('Function call was aborted');
+          err.name = 'AbortError';
+          leave(err);
+        };
+        const timer = setTimeout(
+          () => leave(new FunctionQueueFullError(`AI function call waited over ${this.maxQueueWaitMs} ms for a slot`)),
+          this.maxQueueWaitMs,
+        );
         resume = (): void => {
+          clearTimeout(timer);
           abortSignal?.removeEventListener('abort', onAbort);
           resolve();
         };
@@ -125,9 +173,9 @@ export class FunctionEngine {
   }
 }
 
-function cacheKey(provider: Provider, req: FunctionRequest): string {
+function cacheKey(providerIdentity: string, req: FunctionRequest, system: string, user: string): string {
   return createHash('sha256')
-    .update(JSON.stringify([provider.id, provider.model, req]))
+    .update(JSON.stringify([providerIdentity, CALL_PARAMS, req, system, user]))
     .digest('hex');
 }
 

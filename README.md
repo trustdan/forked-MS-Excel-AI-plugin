@@ -195,6 +195,20 @@ Use AI directly in Excel formulas (cached and batched to prevent UI freezes):
 =EXCELAI.AI_TRANSLATE(D2, "Spanish")
 ```
 
+Each saved model configuration has its own cache, so switching models never returns another model's answers. Changing a configuration's endpoint, model or model file starts a fresh cache; changing only its API key does not. Cached results expire after 30 days, so a model replaced behind the same name and endpoint is eventually picked up. If more than 256 calls are waiting for the model, extra calls return an error; recalculate once the backlog clears.
+
+### 🗂️ Local data and retention
+
+Everything lives in `~/.excelai` (or `EXCELAI_DATA_DIR`), and nothing grows without bound:
+
+| Data | Kept |
+|---|---|
+| `=EXCELAI.AI()` result cache | newest 20,000 results, up to 30 days |
+| Usage ledger (token counts) | newest 200,000 calls, up to 400 days; totals cover this window |
+| Change-sets (for review and undo) | per workbook session: newest 200, up to 24 hours, at most 1,000,000 snapshot cells; older ones can no longer be undone |
+
+`settings.json` is written atomically (temp file, fsync, rename). If it cannot be parsed, or has the wrong shape, it is moved to `settings.json.corrupt-<timestamp>`, the sidecar starts with empty settings, and the Models screen says where the original went. If the file exists but cannot be read at all (for example, it is locked), the sidecar refuses to touch it and settings requests fail until it is readable again.
+
 ---
 
 ## Workspace Layout
