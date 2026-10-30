@@ -30,6 +30,26 @@ const NOT_UNDOABLE: ChangeOp['kind'][] = [
   'delete_cols',
 ];
 
+/**
+ * How many change-sets a manager keeps, and for how long. Sets past any
+ * budget are discarded oldest first; one that is mid-apply or mid-undo is
+ * never discarded. A discarded set can no longer be applied or undone.
+ */
+export interface ChangeSetRetention {
+  maxSets: number;
+  /** Measured from staging. */
+  maxAgeMs: number;
+  /** Cells held across all retained snapshots and post-apply re-reads. */
+  maxRetainedCells: number;
+}
+
+export const DEFAULT_CHANGESET_RETENTION: ChangeSetRetention = {
+  maxSets: 200,
+  maxAgeMs: 24 * 60 * 60 * 1000,
+  // Five sets at the per-set snapshot cap (each holds a snapshot and a re-read).
+  maxRetainedCells: 10 * MAX_SNAPSHOT_CELLS,
+};
+
 export interface ApplyResult {
   ok: boolean;
   /**
@@ -63,6 +83,7 @@ export class ChangeSetManager {
   constructor(
     private executor: WorkbookExecutor,
     private readonly workbookId: string,
+    private readonly retention: ChangeSetRetention = DEFAULT_CHANGESET_RETENTION,
   ) {}
 
   setExecutor(executor: WorkbookExecutor): void {
@@ -82,6 +103,7 @@ export class ChangeSetManager {
       undoFidelity: undoFidelityOf(ops),
     };
     this.changeSets.set(cs.id, cs);
+    this.prune(cs.id);
     return cs;
   }
 
@@ -397,16 +419,39 @@ export class ChangeSetManager {
 
   private track<T>(id: string, run: Promise<T>): Promise<T> {
     this.inFlight.set(id, run);
-    void run.then(
-      () => this.inFlight.delete(id),
-      () => this.inFlight.delete(id),
-    );
+    const settle = (): void => {
+      this.inFlight.delete(id);
+      this.prune();
+    };
+    void run.then(settle, settle);
     return run;
+  }
+
+  /**
+   * Enforces {@link ChangeSetRetention}. Map order is staging order, so
+   * iteration is oldest first. `keep` (a set just staged) is never dropped.
+   */
+  private prune(keep?: string, now = Date.now()): void {
+    const busy = (cs: ChangeSet): boolean =>
+      cs.id === keep || cs.status === 'applying' || cs.status === 'undoing';
+    for (const [id, cs] of this.changeSets) {
+      if (!busy(cs) && now - Date.parse(cs.createdAt) > this.retention.maxAgeMs) this.changeSets.delete(id);
+    }
+    let count = this.changeSets.size;
+    let cells = 0;
+    for (const cs of this.changeSets.values()) cells += retainedCells(cs);
+    for (const [id, cs] of this.changeSets) {
+      if (count <= this.retention.maxSets && cells <= this.retention.maxRetainedCells) break;
+      if (busy(cs)) continue;
+      this.changeSets.delete(id);
+      count--;
+      cells -= retainedCells(cs);
+    }
   }
 
   private mustGet(id: string, expected: ChangeSet['status']): ChangeSet {
     const cs = this.changeSets.get(id);
-    if (!cs) throw new Error(`Unknown change-set: ${id}`);
+    if (!cs) throw new Error(`Unknown change-set: ${id} (only recent change-sets are kept)`);
     if (cs.status === 'applying' || cs.status === 'undoing') {
       throw new Error(`Change-set ${id} is already in progress (${cs.status})`);
     }
@@ -415,6 +460,14 @@ export class ChangeSetManager {
     }
     return cs;
   }
+}
+
+function retainedCells(cs: ChangeSet): number {
+  let n = 0;
+  for (const snap of [...(cs.snapshots ?? []), ...(cs.appliedCells ?? [])]) {
+    for (const row of snap.cells) n += row.length;
+  }
+  return n;
 }
 
 function undoFidelityOf(ops: ChangeOp[]): UndoFidelity {

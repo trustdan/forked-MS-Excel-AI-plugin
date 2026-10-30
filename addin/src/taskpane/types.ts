@@ -41,6 +41,13 @@ export interface SavedProvider {
 export interface ProviderList {
   providers: SavedProvider[];
   activeProviderId: string | null;
+  /** Set when settings.json could not be used and was moved aside. */
+  settingsProblem?: {
+    kind: 'unreadable' | 'invalid';
+    detail: string;
+    preservedAs: string;
+    at: string;
+  };
 }
 
 export const KIND_LABELS: Record<ProviderKind, string> = {

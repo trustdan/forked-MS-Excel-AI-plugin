@@ -138,8 +138,26 @@ export function ModelsScreen({ onChanged }: ModelsScreenProps): JSX.Element {
       );
   };
 
+  const dismissProblem = (): void => {
+    void api('/api/settings/problem', { method: 'DELETE' })
+      .then(load)
+      .catch((e: unknown) => setMessage(`✗ ${e instanceof Error ? e.message : String(e)}`));
+  };
+
+  const problem = list.settingsProblem;
+
   return (
     <main className="settings">
+      {problem && (
+        <div className="banner" role="alert">
+          Your settings file was {problem.kind === 'invalid' ? 'not in the expected format' : 'unreadable'} (
+          {problem.detail}), so the sidecar started with empty settings. The original was kept at{' '}
+          <code>{problem.preservedAs}</code>.{' '}
+          <button className="ghost" onClick={dismissProblem}>
+            Dismiss
+          </button>
+        </div>
+      )}
       <h3>Your models</h3>
       {list.providers.length === 0 && <p className="hint">No models yet — add one below.</p>}
       {list.providers.map((p) => {
