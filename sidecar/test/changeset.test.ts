@@ -248,7 +248,7 @@ describe('change-set serialization (F3)', () => {
 
     const [a, b] = await Promise.all([mgr.apply(cs.id), mgr.apply(cs.id)]);
 
-    expect(a).toEqual({ ok: true, problems: [] });
+    expect(a).toEqual({ ok: true, verification: 'passed', problems: [] });
     expect(b).toEqual(a);
     expect(wb.getValue('Sheet1!A3')).toBe('marker');
     expect(wb.getValue('Sheet1!A4')).toBeNull();
@@ -579,5 +579,128 @@ describe('honest, conflict-aware undo (F8)', () => {
 
     expect(mgr.get(id)?.status).toBe('failed_partial');
     expect(mgr.get(id)?.unrecovered).toEqual(['Sheet1!A1']);
+  });
+});
+
+describe('address-level verification (F4)', () => {
+  const write = (range: string, cells: { value?: number | string; formula?: string }[][]): ChangeOp => ({
+    kind: 'write_range',
+    range,
+    cells,
+    reason: 'x',
+  });
+
+  it('audit probe: an existing =1/0 at A1 does not exempt a new =2/0 at A2', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', { formula: '=1/0' });
+    wb.setCell('Sheet1!A2', 42);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([write('Sheet1!A1:A2', [[{ formula: '=1/0' }], [{ formula: '=2/0' }]])]);
+
+    const result = await mgr.apply(cs.id);
+
+    expect(result).toEqual({ ok: false, verification: 'regressions', problems: ['Sheet1!A2 now contains #DIV/0!'] });
+    expect(mgr.get(cs.id)?.status).toBe('rolled_back');
+    expect(wb.getValue('Sheet1!A2')).toBe(42);
+  });
+
+  it('keeps an error the cell already held, and flags one whose code changed', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', { formula: '=1/0' });
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+
+    const kept = await mgr.stage([write('Sheet1!A1:B1', [[{ formula: '=1/0' }, { value: 5 }]])]);
+    expect((await mgr.apply(kept.id)).ok).toBe(true);
+
+    const changed = await mgr.stage([write('Sheet1!A1', [[{ formula: '=NOSUCHFN(1)' }]])]);
+    expect(await mgr.apply(changed.id)).toMatchObject({
+      ok: false,
+      problems: ['Sheet1!A1 now contains #NAME? (was #DIV/0!)'],
+    });
+  });
+
+  it('treats ordinary text such as #SKU as text, not an error', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([
+      write('Sheet1!A1:A3', [[{ value: '#SKU' }], [{ value: 4 }], [{ formula: '=SUM(A1:A2)' }]]),
+    ]);
+
+    expect(await mgr.apply(cs.id)).toEqual({ ok: true, verification: 'passed', problems: [] });
+    const cells = await wb.readRange('Sheet1!A1:A3');
+    expect(cells.map(([c]) => c)).toEqual([{ value: '#SKU' }, { value: 4 }, { value: 4, formula: '=SUM(A1:A2)' }]);
+  });
+
+  it('reports a cell error code from the emulator only for real error values', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', { formula: '=1/0' });
+    wb.setCell('Sheet1!A2', '#N/A');
+    wb.setCell('Sheet1!A3', '#total');
+    const [[a1], [a2], [a3]] = (await wb.readRange('Sheet1!A1:A3')) as [[object], [object], [object]];
+    expect(a1).toEqual({ value: '#DIV/0!', formula: '=1/0', error: '#DIV/0!' });
+    expect(a2).toEqual({ value: '#N/A', error: '#N/A' });
+    expect(a3).toEqual({ value: '#total' });
+  });
+
+  it('does not count an existing error a sort moved as new', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 3);
+    wb.setCell('Sheet1!A2', '#N/A');
+    wb.setCell('Sheet1!A3', 1);
+    const mgr = new ChangeSetManager(wb, 'wb-1');
+    const cs = await mgr.stage([
+      { kind: 'sort_range', range: 'Sheet1!A1:A3', keyOffset: 0, ascending: true, hasHeader: false, reason: 'x' },
+    ]);
+
+    expect((await mgr.apply(cs.id)).ok).toBe(true);
+    expect(wb.getValue('Sheet1!A2')).not.toBe('#N/A'); // the error did move
+  });
+
+  it('returns verification incomplete, never ok, when a written range cannot be re-read', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    wb.setCell('Sheet1!A1', 'old');
+    let reads = 0;
+    const flaky: WorkbookExecutor = {
+      getWorkbookMap: () => wb.getWorkbookMap(),
+      // The snapshot read works; the verification re-read fails; the rollback's reads work.
+      readRange: async (range) => {
+        if (++reads === 2) throw new Error('host disconnected');
+        return wb.readRange(range);
+      },
+      find: (q, s) => wb.find(q, s),
+      applyOps: (ops) => wb.applyOps(ops),
+    };
+    const mgr = new ChangeSetManager(flaky, 'wb-1');
+    const cs = await mgr.stage([write('Sheet1!A1', [[{ value: 'new' }]])]);
+
+    const result = await mgr.apply(cs.id);
+
+    expect(result).toEqual({
+      ok: false,
+      verification: 'incomplete',
+      problems: ['Sheet1!A1 could not be re-read: host disconnected'],
+    });
+    expect(mgr.get(cs.id)?.status).toBe('rolled_back');
+    expect(wb.getValue('Sheet1!A1')).toBe('old');
+  });
+
+  it('keeps a set staged when a target range cannot be snapshotted', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const mgr = new ChangeSetManager(
+      {
+        getWorkbookMap: () => wb.getWorkbookMap(),
+        readRange: async () => {
+          throw new Error('host disconnected');
+        },
+        find: (q, s) => wb.find(q, s),
+        applyOps: (ops) => wb.applyOps(ops),
+      },
+      'wb-1',
+    );
+    const cs = await mgr.stage([write('Sheet1!A1', [[{ value: 'new' }]])]);
+
+    await expect(mgr.apply(cs.id)).rejects.toThrow('host disconnected');
+    expect(mgr.get(cs.id)?.status).toBe('staged');
+    expect(wb.getValue('Sheet1!A1')).toBeNull();
   });
 });

@@ -265,6 +265,14 @@ Every change-set is verified *after* the model acts, before it counts as done:
 
 Any failure triggers automatic rollback via the change-set snapshot machinery (§8.2) and feeds the failure back to the model for a bounded retry. **Precision becomes a property of the system, not of the model.**
 
+**What is verified today** (`sidecar/src/changeset/manager.ts`). The bullets above are the target; the shipped check is narrower:
+
+- **Scope: the written ranges only** (`write_range`, `clear_range`, `sort_range` targets). Each is snapshotted before apply and re-read after. Cells outside them — including formulas elsewhere that depend on the written cells — are not checked, so an error that only appears in a dependent is not caught.
+- **Errors are compared by address.** A cell is a regression when it holds an error value it did not hold before, or a different error code. An error the cell already held is not a regression, and it does not exempt other cells. Inside a sorted range errors move with their rows, so there a code counts only when it occurs more often than before.
+- **Errors come from the executor, not from a `#` prefix.** Each cell carries `error` (the code) only when it holds an Excel error value: Office.js `valueTypes` in the add-in, the formula engine's result in the emulator. Text such as `#SKU` is text.
+- **An unreadable re-read is not success.** If a written range can't be re-read, apply returns `verification: 'incomplete'` and the set is rolled back. A snapshot read that fails, other than for a sheet the same set adds or renames into, aborts the apply before anything is written.
+- **Formula meaning is not checked after apply.** A formula that evaluates without error is accepted. Before staging, `write_range` formulas get only syntax fixes (leading `=`, `;` separators, unclosed parentheses), each reported to the model. References that look misaligned (onto blank or label cells of the block being written) are sent back to the model with candidates, never rewritten; the model may re-send a formula unchanged to keep it.
+
 ### 5.5 Deterministic skills do the precision work
 
 The model never performs arithmetic or data transformation token-by-token. Excel's own engine calculates; sidecar skills (dedupe, fuzzy matching, joins, descriptive stats, pivot construction — §10) execute exactly; `query_table` aggregates without the model ever seeing raw rows it doesn't need. The model's job is reduced to what LLMs are actually good at — interpreting intent, choosing the skill, setting parameters, explaining results — and the part that must be *exact* is code.

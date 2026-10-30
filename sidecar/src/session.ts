@@ -138,7 +138,9 @@ export class Session {
             kind: 'error',
             message: this.describeFailure(
               changeSetId,
-              `Change-set verification failed:\n${result.problems.join('\n')}`,
+              result.verification === 'incomplete'
+                ? `Change-set could not be verified, so it was rolled back:\n${result.problems.join('\n')}`
+                : `Change-set verification failed:\n${result.problems.join('\n')}`,
             ),
           });
         }

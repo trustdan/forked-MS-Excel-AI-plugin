@@ -602,77 +602,76 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(wb.getValue('Sheet1!B3')).toBe(419500);
   });
 
-  it('auto-balances missing parens, repairs off-by-one SUM/subtotal rows in write_range, replaces same-start-cell drafts, and stops multi-pass rewrite loops', async () => {
+  it('balances missing parens with a reported correction, sends off-by-one SUM/subtotal refs back instead of rewriting them, replaces same-start-cell drafts, and stops multi-pass rewrite loops', async () => {
     const wb = new WorkbookEmulator(['Sheet1']);
+    const balanceSheet = (f: { liab: string; totalLiab: string; equity: string; total: string }) => [
+      ['Pax Vans'],
+      ['Balance Sheet'],
+      ['As of December 31, 2024'],
+      [''],
+      ['ASSETS:'],
+      ['Current Assets:'],
+      ['Cash', 401900],
+      ['Raw Materials', 419500],
+      ['WIP Inventory', 0],
+      ['FG Inventory', 0],
+      ['Total Current Assets', { formula: '=SUM(B7:B10' }],
+      [''],
+      ['Non-Current Assets:'],
+      ['Property, Plant and Equipment:'],
+      ['Rental Vans', 469700],
+      ['Manufacturing Equipment, net', 165000],
+      ['Property, Plant, and Equip, Net', { formula: '=SUM(B15:B16' }],
+      [''],
+      ['TOTAL ASSETS', { formula: '=SUM(B11,B17)' }],
+      [''],
+      ['LIABILITIES:'],
+      ['Current Liabilities:'],
+      ['Accounts Payable', 220400],
+      ['Deferred Revenue (Customer Deposits)', 122500],
+      ['Total Current Liabilities', { formula: f.liab }],
+      [''],
+      ['TOTAL LIABILITIES', { formula: f.totalLiab }],
+      [''],
+      ["SHAREHOLDERS' EQUITY:"],
+      ['Common Stock', 1250000],
+      ['Retained Earnings (Loss)', -136800],
+      ["TOTAL SHAREHOLDERS' EQUITY", { formula: f.equity }],
+      ["TOTAL LIAB. & SHAREHOLDERS' EQUITY", { formula: f.total }],
+    ];
+    const reason = 'Create baseline balance sheet as of 12/31/2024';
     const provider = new ScriptedProvider([
-      // Attempt 1: 31 rows with missing closing paren "=SUM(B7:B10"
+      // Attempt 1: 11 rows with a missing closing paren "=SUM(B7:B10"
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: { range: 'Sheet1!A1', cells: balanceSheet({ liab: '', totalLiab: '', equity: '', total: '' }).slice(0, 11), reason: 'Initial draft' },
+          },
+        ],
+      },
+      // Attempt 2: 33 rows with off-by-one liabilities/equity formulas
       {
         toolCalls: [
           {
             name: 'write_range',
             args: {
               range: 'Sheet1!A1',
-              cells: [
-                ['Pax Vans'],
-                ['Balance Sheet'],
-                ['As of December 31, 2024'],
-                [''],
-                ['ASSETS:'],
-                ['Current Assets:'],
-                ['Cash', 401900],
-                ['Raw Materials', 419500],
-                ['WIP Inventory', 0],
-                ['FG Inventory', 0],
-                ['Total Current Assets', { formula: '=SUM(B7:B10' }],
-              ],
-              reason: 'Initial draft',
+              cells: balanceSheet({ liab: '=SUM(B22:B23)', totalLiab: '=B24', equity: '=SUM(B28:B29)', total: '=B25+B30' }),
+              reason,
             },
           },
         ],
       },
-      // Attempt 2: 33 rows at Sheet1!A1 with off-by-one liabilities/equity formulas (=SUM(B22:B23), =B24, =SUM(B28:B29), =B25+B30)
+      // Attempt 3: the model applies the suggested candidates
       {
         toolCalls: [
           {
             name: 'write_range',
             args: {
               range: 'Sheet1!A1',
-              cells: [
-                ['Pax Vans'],
-                ['Balance Sheet'],
-                ['As of December 31, 2024'],
-                [''],
-                ['ASSETS:'],
-                ['Current Assets:'],
-                ['Cash', 401900],
-                ['Raw Materials', 419500],
-                ['WIP Inventory', 0],
-                ['FG Inventory', 0],
-                ['Total Current Assets', { formula: '=SUM(B7:B10' }],
-                [''],
-                ['Non-Current Assets:'],
-                ['Property, Plant and Equipment:'],
-                ['Rental Vans', 469700],
-                ['Manufacturing Equipment, net', 165000],
-                ['Property, Plant, and Equip, Net', { formula: '=SUM(B15:B16' }],
-                [''],
-                ['TOTAL ASSETS', { formula: '=SUM(B11,B17)' }],
-                [''],
-                ['LIABILITIES:'],
-                ['Current Liabilities:'],
-                ['Accounts Payable', 220400],
-                ['Deferred Revenue (Customer Deposits)', 122500],
-                ['Total Current Liabilities', { formula: '=SUM(B22:B23)' }],
-                [''],
-                ['TOTAL LIABILITIES', { formula: '=B24' }],
-                [''],
-                ["SHAREHOLDERS' EQUITY:"],
-                ['Common Stock', 1250000],
-                ['Retained Earnings (Loss)', -136800],
-                ["TOTAL SHAREHOLDERS' EQUITY", { formula: '=SUM(B28:B29)' }],
-                ["TOTAL LIAB. & SHAREHOLDERS' EQUITY", { formula: '=B25+B30' }],
-              ],
-              reason: 'Create baseline balance sheet as of 12/31/2024',
+              cells: balanceSheet({ liab: '=SUM(B23:B24)', totalLiab: '=B25', equity: '=SUM(B30:B31)', total: '=B27+B32' }),
+              reason,
             },
           },
         ],
@@ -682,25 +681,46 @@ describe('agent loop (full integration against the emulator)', () => {
 
     const { stagedId, changeSets } = await runScript(wb, provider);
     expect(stagedId).toBeDefined();
+    const toolResult = (step: number) => {
+      const msg = provider.requests.at(step)?.messages.findLast((m) => m.role === 'tool');
+      return JSON.parse(msg && 'content' in msg ? msg.content : '{}');
+    };
 
-    // Attempt 2 replaced Attempt 1 (despite 11 rows vs 33 rows) so stagedOpsCount stayed 1
+    // Attempt 1 staged; the paren fix is reported, not silent.
+    expect(toolResult(1).corrections).toEqual([
+      { cell: 'Sheet1!B11', from: '=SUM(B7:B10', to: '=SUM(B7:B10)', fix: 'closed 1 unbalanced parenthesis' },
+    ]);
+    expect(toolResult(1).note).not.toContain('valid');
+
+    // Attempt 2 staged nothing: each shifted reference came back with a candidate.
+    const rejected = toolResult(2);
+    expect(rejected.ok).toBe(false);
+    expect(
+      rejected.diagnostics.map((d: { cell: string; formula: string; candidates: string[] }) => [d.cell, d.formula, d.candidates]),
+    ).toEqual([
+      ['Sheet1!B25', '=SUM(B22:B23)', ['=SUM(B23:B24)']],
+      ['Sheet1!B27', '=B24', ['=B25']],
+      ['Sheet1!B32', '=SUM(B28:B29)', ['=SUM(B30:B31)']],
+      ['Sheet1!B33', '=B25+B30', ['=B27+B32']],
+    ]);
+
+    // Attempt 3 replaced attempt 1 (11 rows vs 33 rows), so the set holds one op.
     const cs = changeSets.get(stagedId!)!;
     expect(cs.ops).toHaveLength(1);
     expect(cs.ops[0]?.kind === 'write_range' ? cs.ops[0].range : '').toBe('Sheet1!A1:B33');
 
-    // Step 3 had tools disabled to prevent a 3rd/4th write_range rewrite loop
-    expect(provider.requests.at(2)?.tools).toBeUndefined();
+    // The step after the re-stage had tools disabled to prevent a rewrite loop.
+    expect(provider.requests.at(3)?.tools).toBeUndefined();
 
-    // Apply and verify that all formulas were balanced and off-by-one rows repaired
     const applied = await changeSets.apply(stagedId!);
     expect(applied.ok).toBe(true);
     expect(wb.getValue('Sheet1!B11')).toBe(821400); // =SUM(B7:B10)
     expect(wb.getValue('Sheet1!B17')).toBe(634700); // =SUM(B15:B16)
     expect(wb.getValue('Sheet1!B19')).toBe(1456100); // =SUM(B11,B17)
-    expect(wb.getValue('Sheet1!B25')).toBe(342900); // repaired from =SUM(B22:B23) -> =SUM(B23:B24)
-    expect(wb.getValue('Sheet1!B27')).toBe(342900); // repaired from =B24 -> =B25
-    expect(wb.getValue('Sheet1!B32')).toBe(1113200); // repaired from =SUM(B28:B29) -> =SUM(B30:B31)
-    expect(wb.getValue('Sheet1!B33')).toBe(1456100); // repaired from =B25+B30 -> =B27+B32
+    expect(wb.getValue('Sheet1!B25')).toBe(342900);
+    expect(wb.getValue('Sheet1!B27')).toBe(342900);
+    expect(wb.getValue('Sheet1!B32')).toBe(1113200);
+    expect(wb.getValue('Sheet1!B33')).toBe(1456100);
   });
 
   it('deduplicates repeated [Attached Document] blocks across multi-turn history so Turn 2+ does not overflow local model context', async () => {
@@ -750,9 +770,26 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(result.history).toHaveLength(4);
   });
 
-  it('recovers from left-to-right layout rumination by locking a 5-column side-by-side decision and repairs wrong label-column references in right-hand value columns', async () => {
+  it('recovers from left-to-right layout rumination by locking a 5-column side-by-side decision and sends wrong label-column references in right-hand value columns back for correction', async () => {
     const wb = new WorkbookEmulator(['Sheet1']);
     const changeSets = new ChangeSetManager(wb, 'wb-test');
+    const sideBySide = (liab: string, equity: string, total: string) => [
+      ['Pax Vans - Balance Sheet as of 12/31/2024'],
+      [''],
+      ['ASSETS', null, null, 'LIABILITIES & EQUITY', null],
+      ['Current Assets:', null, null, 'Current Liabilities:', null],
+      ['Cash', 401900, null, 'Accounts Payable', 220400],
+      ['Raw Materials', 419500, null, 'Deferred Revenue', 122500],
+      ['WIP Inventory', 0, null, 'Total Liabilities', { formula: liab }],
+      ['FG Inventory', 0, null, null, null],
+      ['Total Current Assets', { formula: '=SUM(B5:B8)' }, null, "SHAREHOLDERS' EQUITY", null],
+      ['', null, null, 'Common Stock', 1250000],
+      ['Non-Current Assets:', null, null, 'Retained Earnings', -136800],
+      ['Rental Vans', 469700, null, 'Total Equity', { formula: equity }],
+      ['Manufacturing Equipment, net', 165000, null, null, null],
+      ['PPE, Net', { formula: '=SUM(B12:B13)' }, null, null, null],
+      ['TOTAL ASSETS', { formula: '=B9+B14' }, null, 'TOTAL LIAB. & EQUITY', { formula: total }],
+    ];
 
     const ruminatingThought = [
       'We have Exhibit 1 balance sheet 12/31/2024.\nAssets:\nCash 401,900\nRaw Materials 419,500\nRental Vans 469,700\nManufacturing Equipment, net 165,000\n\nLiabilities:\nAccounts Payable 220,400\nDeferred Revenue 122,500\nCommon Stock 1,250,000\nRetained Earnings (136,800)',
@@ -773,23 +810,19 @@ describe('agent loop (full integration against the emulator)', () => {
             name: 'write_range',
             args: {
               range: 'Sheet1!A1',
-              cells: [
-                ['Pax Vans - Balance Sheet as of 12/31/2024'],
-                [''],
-                ['ASSETS', null, null, 'LIABILITIES & EQUITY', null],
-                ['Current Assets:', null, null, 'Current Liabilities:', null],
-                ['Cash', 401900, null, 'Accounts Payable', 220400],
-                ['Raw Materials', 419500, null, 'Deferred Revenue', 122500],
-                ['WIP Inventory', 0, null, 'Total Liabilities', { formula: '=SUM(D5:D6)' }],
-                ['FG Inventory', 0, null, null, null],
-                ['Total Current Assets', { formula: '=SUM(B5:B8)' }, null, "SHAREHOLDERS' EQUITY", null],
-                ['', null, null, 'Common Stock', 1250000],
-                ['Non-Current Assets:', null, null, 'Retained Earnings', -136800],
-                ['Rental Vans', 469700, null, 'Total Equity', { formula: '=SUM(D10:D11)' }],
-                ['Manufacturing Equipment, net', 165000, null, null, null],
-                ['PPE, Net', { formula: '=SUM(B12:B13)' }, null, null, null],
-                ['TOTAL ASSETS', { formula: '=B9+B14' }, null, 'TOTAL LIAB. & EQUITY', { formula: '=D7+D12' }],
-              ],
+              cells: sideBySide('=SUM(D5:D6)', '=SUM(D10:D11)', '=D7+D12'),
+              reason: 'Create 2024 side-by-side balance sheet with Assets on left and Liabilities & Equity on right',
+            },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1',
+              cells: sideBySide('=SUM(E5:E6)', '=SUM(E10:E11)', '=E7+E12'),
               reason: 'Create 2024 side-by-side balance sheet with Assets on left and Liabilities & Equity on right',
             },
           },
@@ -817,6 +850,18 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(recoveryText).toContain('Cash 401,900');
     expect(recoveryText).not.toContain("This is getting too complicated. Let's step back.");
 
+    // The first write staged nothing: the label-column references came back with candidates.
+    const rejectedMsg = provider.requests.at(2)?.messages.findLast((m) => m.role === 'tool');
+    const rejected = JSON.parse(rejectedMsg && 'content' in rejectedMsg ? rejectedMsg.content : '{}');
+    expect(rejected.ok).toBe(false);
+    expect(
+      rejected.diagnostics.map((d: { cell: string; candidates: string[] }) => [d.cell, d.candidates]),
+    ).toEqual([
+      ['Sheet1!E7', ['=SUM(E5:E6)']],
+      ['Sheet1!E12', ['=SUM(E10:E11)']],
+      ['Sheet1!E15', ['=E7+E12']],
+    ]);
+
     expect(result.stagedChangeSetId).toBeDefined();
     const applied = await changeSets.apply(result.stagedChangeSetId!);
     expect(applied.ok).toBe(true);
@@ -826,7 +871,7 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(wb.getValue('Sheet1!B14')).toBe(634700); // PPE, Net
     expect(wb.getValue('Sheet1!B15')).toBe(1456100); // TOTAL ASSETS
 
-    // Right side (Liabilities & Equity in Column E — repaired from D5:D6, D10:D11, and D7+D12)
+    // Right side (Liabilities & Equity in Column E, as corrected by the model)
     expect(wb.getValue('Sheet1!E7')).toBe(342900); // Total Liabilities
     expect(wb.getValue('Sheet1!E12')).toBe(1113200); // Total Equity
     expect(wb.getValue('Sheet1!E15')).toBe(1456100); // TOTAL LIAB. & EQUITY
@@ -1045,5 +1090,97 @@ describe('agent loop (full integration against the emulator)', () => {
     expect((await changeSets.apply(stagedId!)).ok).toBe(true);
     expect(wb.getValue('Data!A1')).toBe(1);
     expect(wb.getValue('Payroll!A1')).toBeNull();
+  });
+});
+
+describe('formula meaning (F2)', () => {
+  /** Runs one write_range call then a closing reply; returns the tool result and the staged set. */
+  async function stageWrite(wb: WorkbookEmulator, range: string, cells: unknown[][], extra: object[] = []) {
+    const write = { name: 'write_range', args: { range, cells, reason: 'test write' } };
+    const provider = new ScriptedProvider([{ toolCalls: [write] }, ...extra, { text: 'Done.' }]);
+    const run = await runScript(wb, provider);
+    const toolResult = (step: number) => {
+      const msg = provider.requests.at(step)?.messages.findLast((m) => m.role === 'tool');
+      return JSON.parse(msg && 'content' in msg ? msg.content : '{}');
+    };
+    return { ...run, toolResult, provider };
+  }
+
+  it('Prior subtotal probe: a valid total of an earlier block keeps its references', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const { stagedId, changeSets, toolResult } = await stageWrite(wb, 'Sheet1!A1', [
+      ['Prior A', 10],
+      ['Prior B', 20],
+      [''],
+      ['Current A', 30],
+      ['Current B', 40],
+      ['Prior subtotal', { formula: '=SUM(B1:B2)' }],
+    ]);
+
+    expect(toolResult(1).ok).toBe(true);
+    expect(toolResult(1).diagnostics).toBeUndefined();
+    const op = changeSets.get(stagedId!)!.ops[0]!;
+    expect(op.kind === 'write_range' ? op.cells[5]?.[1] : undefined).toEqual({ formula: '=SUM(B1:B2)' });
+    expect((await changeSets.apply(stagedId!)).ok).toBe(true);
+    expect(wb.getValue('Sheet1!B6')).toBe(30);
+  });
+
+  it('keeps references to another column, absolute references and another sheet as written', async () => {
+    const wb = new WorkbookEmulator(['Sheet1', 'Rates']);
+    wb.setCell('Rates!A1', 2);
+    const formulas = ['=SUM(C1:C2)', '=SUM($B$1:$B$2)', '=Rates!A1*B1', "='Rates'!A1+B2"];
+    const { stagedId, changeSets, toolResult } = await stageWrite(wb, 'Sheet1!A1', [
+      ['A', 10, 1],
+      ['B', 20, 2],
+      [''],
+      ...formulas.map((f) => ['total', { formula: f }]),
+    ]);
+
+    expect(toolResult(1).ok).toBe(true);
+    const op = changeSets.get(stagedId!)!.ops[0]!;
+    const staged = op.kind === 'write_range' ? op.cells.slice(3).map((row) => row[1]) : [];
+    expect(staged).toEqual(formulas.map((formula) => ({ formula })));
+    expect((await changeSets.apply(stagedId!)).ok).toBe(true);
+    expect([4, 5, 6, 7].map((r) => wb.getValue(`Sheet1!B${r}`))).toEqual([3, 30, 20, 22]);
+  });
+
+  it('fixes only unambiguous syntax and reports each correction', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const { stagedId, changeSets, toolResult } = await stageWrite(wb, 'Sheet1!A1', [
+      [1, 2, { formula: 'SUM(A1:B1)' }, { formula: '=IF(A1>0;"a;b";B1)' }, { formula: '=ROUND(A1/B1,1' }],
+    ]);
+
+    expect(toolResult(1).corrections).toEqual([
+      { cell: 'Sheet1!C1', from: 'SUM(A1:B1)', to: '=SUM(A1:B1)', fix: 'added the leading "="' },
+      {
+        cell: 'Sheet1!D1',
+        from: '=IF(A1>0;"a;b";B1)',
+        to: '=IF(A1>0,"a;b",B1)',
+        fix: 'replaced ";" argument separators with en-US ","',
+      },
+      { cell: 'Sheet1!E1', from: '=ROUND(A1/B1,1', to: '=ROUND(A1/B1,1)', fix: 'closed 1 unbalanced parenthesis' },
+    ]);
+    expect((await changeSets.apply(stagedId!)).ok).toBe(true);
+    expect(wb.getValue('Sheet1!C1')).toBe(3);
+  });
+
+  it('stages a flagged formula as written once the model re-sends it unchanged', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const cells = [['Header'], ['', 5], ['', 7], ['Total', { formula: '=SUM(B1:B2)' }]];
+    const resend = { toolCalls: [{ name: 'write_range', args: { range: 'Sheet1!A1', cells, reason: 'test write' } }] };
+    const { stagedId, changeSets, toolResult } = await stageWrite(wb, 'Sheet1!A1', cells, [resend]);
+
+    expect(toolResult(1).ok).toBe(false);
+    expect(toolResult(1).diagnostics).toEqual([
+      {
+        cell: 'Sheet1!B4',
+        formula: '=SUM(B1:B2)',
+        issue: expect.stringContaining('B2:B3'),
+        candidates: ['=SUM(B2:B3)'],
+      },
+    ]);
+    expect(toolResult(2)).toMatchObject({ ok: true, staged: true, stagedAsWritten: ['Sheet1!B4'] });
+    expect((await changeSets.apply(stagedId!)).ok).toBe(true);
+    expect(wb.getValue('Sheet1!B4')).toBe(5);
   });
 });
