@@ -148,7 +148,9 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
   let forceTextReplyNext = false;
   let emittedAnything = false;
   let reasoningRecoveryCount = 0;
+  let deferredWriteRetryCount = 0;
   const MAX_REASONING_RECOVERY_ATTEMPTS = 2;
+  const MAX_DEFERRED_WRITE_RETRIES = 2;
   const RECOVERY_NUDGE =
     '[System note: Your previous completion ran out of tokens or hit a JSON formatting loop before finishing the tool call. Do not deliberate, recount rows, or pretty-print — immediately emit your next tool call (e.g. write_range starting at "Sheet1!A1") as compact single-line JSON with no extra whitespace, or reply with your final summary concisely.]';
   const emit = (ev: AgentEvent): void => {
@@ -180,7 +182,7 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
         provider.chat({
           messages: providerMessages,
           tools: provider.supportsTools && !disableToolsForStep ? specs : undefined,
-          temperature: reasoningRecoveryCount > 0 ? 0.2 : 0,
+          temperature: reasoningRecoveryCount > 0 || deferredWriteRetryCount > 0 ? 0.2 : 0,
           reasoningEffort: 'low',
            // Generous budget for reasoning + large write_range tool calls,
           // expanded further when recovering from reasoning token exhaustion.
@@ -280,8 +282,6 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
       }
     }
 
-    if (assistantText.trim()) emit({ kind: 'text', text: assistantText });
-
     if (toolCalls.length === 0) {
       // Rescue complete tool-call JSON payloads drafted inside reasoning_content when the
       // model hit max_tokens before emitting the formal tool call.
@@ -292,6 +292,37 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
         }
       }
     }
+
+    // Guard against "all-talk / no-tool" replies where the model refuses to overwrite a prior turn's
+    // staged change-set, promises to stage the reorganized layout "next", or claims it staged changes
+    // in plain text when pendingOps is still empty.
+    if (
+      toolCalls.length === 0 &&
+      pendingOps.length === 0 &&
+      assistantText.trim() &&
+      !disableToolsForStep &&
+      deferredWriteRetryCount < MAX_DEFERRED_WRITE_RETRIES &&
+      iteration + 1 < maxIterations &&
+      shouldRetryDeferredOrUnstagedWrite(assistantText, options.userMessage, options.history)
+    ) {
+      deferredWriteRetryCount++;
+      emit({
+        kind: 'thinking_delta',
+        text: '\nStaging requested layout via write_range…\n',
+      });
+      recoveryMessageIndices.add(messages.length);
+      messages.push({ role: 'assistant', content: assistantText });
+      const nudge = buildDeferredWriteRetryNudge(
+        options.userMessage,
+        assistantText,
+        options.history,
+      );
+      recoveryMessageIndices.add(messages.length);
+      messages.push({ role: 'user', content: nudge });
+      continue;
+    }
+
+    if (assistantText.trim()) emit({ kind: 'text', text: assistantText });
 
     if (toolCalls.length === 0) {
       if (!assistantText.trim()) {
@@ -493,7 +524,12 @@ async function executeToolCall(
   if (typeof rawArgs === 'object' && rawArgs !== null) {
     const rec = rawArgs as Record<string, unknown>;
     if (typeof rec.range === 'string' && rec.range.trim().length > 0) {
-      rec.range = await normalizeRangeForWorkbook(rec.range, workbookName, getCachedMap);
+      rec.range = await normalizeRangeForWorkbook(
+        rec.range,
+        workbookName,
+        getCachedMap,
+        pendingOps,
+      );
     }
     if (toolName === 'write_range' && Array.isArray(rec.cells)) {
       rec.cells = repairWriteRangeCells(
@@ -645,7 +681,7 @@ async function executeToolCall(
           colsStaged,
           replacedPriorDraft,
           stagedOpsCount: pendingOps.length,
-          note: `Staged ${rowsStaged}×${colsStaged} table at ${op.range} into the pending change-set${replacedPriorDraft ? ` (replaced prior draft at ${startCellA1})` : ''}. All formulas are balanced and valid. Do NOT call write_range on ${startCellA1} again — reply to the user with a concise summary to finish (or call format_range once if formatting is needed).`,
+          note: `Staged ${rowsStaged}×${colsStaged} table at ${op.range} into the pending change-set for this turn${replacedPriorDraft ? ` (replaced prior draft at ${startCellA1})` : ''}. All formulas are balanced and valid. For this turn, you may now call format_range once if needed, or reply to the user with a concise summary.`,
         });
       }
       pendingOps.push(op);
@@ -733,6 +769,7 @@ function prepareMessagesForProvider(
   priorHistoryEndIdx: number,
 ): ChatMessage[] {
   const seenDocsFromNewest = new Set<string>();
+  let keptLatestPriorWriteRange = false;
   const docBlockRe = /\[Attached Document:\s*([^\n\]]+?)\]\r?\n```[^\r\n]*\r?\n[\s\S]*?\r?\n```/g;
 
   const prepared: ChatMessage[] = new Array(messages.length);
@@ -753,38 +790,77 @@ function prepareMessagesForProvider(
       continue;
     }
 
-    if (
-      msg.role === 'assistant' &&
-      i < priorHistoryEndIdx &&
-      msg.toolCalls &&
-      msg.toolCalls.length > 0
-    ) {
-      let changed = false;
-      const compactedCalls = msg.toolCalls.map((tc) => {
-        if (tc.name !== 'write_range' || tc.argsJson.length <= 1200) return tc;
+    if (msg.role === 'tool' && i < priorHistoryEndIdx) {
+      if (msg.content.includes('"staged":true') || msg.content.includes('Do NOT call write_range')) {
         try {
-          const parsed = JSON.parse(tc.argsJson) as Record<string, unknown>;
-          if (!Array.isArray(parsed.cells) || parsed.cells.length <= 8) return tc;
-          const totalRows = parsed.cells.length;
-          const omitted = totalRows - 6;
-          const compactCells = [
-            ...parsed.cells.slice(0, 3),
-            [`... (${omitted} middle rows omitted from prior turn history; total ${totalRows} rows)`],
-            ...parsed.cells.slice(-3),
-          ];
-          changed = true;
-          return {
-            ...tc,
-            argsJson: JSON.stringify({
-              ...parsed,
-              cells: compactCells,
-            }),
-          };
+          const parsed = JSON.parse(msg.content) as Record<string, unknown>;
+          if (typeof parsed.note === 'string') {
+            parsed.note =
+              'Completed in a previous turn. If the user asks to reorganize, revise, or replace this table in the current turn (or confirms with "yes" / "sounds good" / "let\'s do it"), you MUST call write_range again in this turn (e.g. starting at Sheet1!A1) to stage the new version.';
+            prepared[i] = { ...msg, content: JSON.stringify(parsed) };
+            continue;
+          }
         } catch {
-          return tc;
+          // ignore
         }
-      });
-      prepared[i] = changed ? { ...msg, toolCalls: compactedCalls } : msg;
+      }
+      prepared[i] = msg;
+      continue;
+    }
+
+    if (msg.role === 'assistant' && i < priorHistoryEndIdx) {
+      let cleanedContent = msg.content;
+      if (cleanedContent) {
+        cleanedContent = cleanedContent
+          .replace(
+            /[^.!\n]*(?:kept the staged version|keeping the prior staged version|previous version is already staged|won['’]t overwrite it again)[^.!\n]*[.!]?\s*/gi,
+            '',
+          )
+          .trim();
+      }
+
+      if (msg.toolCalls && msg.toolCalls.length > 0) {
+        let changed = cleanedContent !== msg.content;
+        const compactedCalls = msg.toolCalls.map((tc) => {
+          if (tc.name !== 'write_range') return tc;
+          // Always preserve the most recent prior write_range call in full (up to 12,000 chars)
+          // so follow-up turns ("reorganize it left to right") have all accounts and values from Turn 1.
+          if (!keptLatestPriorWriteRange && tc.argsJson.length <= 12000) {
+            keptLatestPriorWriteRange = true;
+            return tc;
+          }
+          keptLatestPriorWriteRange = true;
+          if (tc.argsJson.length <= 1200) return tc;
+          try {
+            const parsed = JSON.parse(tc.argsJson) as Record<string, unknown>;
+            if (!Array.isArray(parsed.cells) || parsed.cells.length <= 8) return tc;
+            const totalRows = parsed.cells.length;
+            const omitted = totalRows - 6;
+            const compactCells = [
+              ...parsed.cells.slice(0, 3),
+              [`... (${omitted} middle rows omitted from older turn history; total ${totalRows} rows)`],
+              ...parsed.cells.slice(-3),
+            ];
+            changed = true;
+            return {
+              ...tc,
+              argsJson: JSON.stringify({
+                ...parsed,
+                cells: compactCells,
+              }),
+            };
+          } catch {
+            return tc;
+          }
+        });
+        prepared[i] = changed
+          ? { ...msg, content: cleanedContent, toolCalls: compactedCalls }
+          : msg;
+        continue;
+      }
+
+      prepared[i] =
+        cleanedContent !== msg.content ? { ...msg, content: cleanedContent } : msg;
       continue;
     }
 
@@ -928,14 +1004,16 @@ function safeParseJson(s: string): unknown {
 }
 
 /**
- * Local models sometimes omit the sheet prefix ("A1:B5") or pass the workbook
- * filename as the sheet prefix ("Book 2026-10-28.xlsx!A1:B5"). Resolves both
- * to the first actual worksheet in the workbook.
+ * Local models sometimes omit the sheet prefix ("A1:B5"), pass the workbook
+ * filename as the sheet prefix ("Book 2026-10-28.xlsx!A1:B5"), or default to
+ * "Sheet1!A1:B5" when the workbook tab has a different name. Resolves these to
+ * the actual worksheet in the workbook.
  */
 async function normalizeRangeForWorkbook(
   range: string,
   workbookName: string,
   getCachedMap: () => Promise<WorkbookMap>,
+  pendingOps?: ChangeOp[],
 ): Promise<string> {
   const trimmed = range.trim();
   const bang = trimmed.lastIndexOf('!');
@@ -952,27 +1030,42 @@ async function normalizeRangeForWorkbook(
 
   const rawSheet = trimmed.slice(0, bang).replace(/^'|'$/g, '').trim();
   const addrPart = trimmed.slice(bang + 1);
-  const wbLower = workbookName.trim().toLowerCase();
-  const wbBaseLower = wbLower.replace(/\.(xlsx|xlsm|xlsb|xls|csv)$/i, '');
   const sheetLower = rawSheet.toLowerCase();
-  const looksLikeWorkbookFile =
-    sheetLower === wbLower ||
-    (wbBaseLower.length > 0 && sheetLower === wbBaseLower) ||
-    /\.(xlsx|xlsm|xlsb|xls|csv)$/i.test(rawSheet);
-
-  if (!looksLikeWorkbookFile) return trimmed;
 
   try {
     const map = await getCachedMap();
-    if (map.sheets.some((s) => s.name.toLowerCase() === sheetLower)) {
+    const existing = map.sheets.find((s) => s.name.trim().toLowerCase() === sheetLower);
+    if (existing) {
+      const quoted = /^[A-Za-z0-9_]+$/.test(existing.name) ? existing.name : `'${existing.name}'`;
+      return `${quoted}!${addrPart}`;
+    }
+    const addedInTurn = pendingOps?.some(
+      (op) =>
+        (op.kind === 'add_sheet' && op.name.trim().toLowerCase() === sheetLower) ||
+        (op.kind === 'rename_sheet' && op.newName.trim().toLowerCase() === sheetLower),
+    );
+    if (addedInTurn) {
       return trimmed;
     }
-    const actualSheet = map.sheets[0]?.name ?? 'Sheet1';
-    const quoted = /^[A-Za-z0-9_]+$/.test(actualSheet) ? actualSheet : `'${actualSheet}'`;
-    return `${quoted}!${addrPart}`;
+    const wbLower = workbookName.trim().toLowerCase();
+    const wbBaseLower = wbLower.replace(/\.(xlsx|xlsm|xlsb|xls|csv)$/i, '');
+    const looksLikeWorkbookFile =
+      sheetLower === wbLower ||
+      (wbBaseLower.length > 0 && sheetLower === wbBaseLower) ||
+      /\.(xlsx|xlsm|xlsb|xls|csv)$/i.test(rawSheet);
+
+    if (
+      map.sheets.length > 0 &&
+      (looksLikeWorkbookFile || sheetLower === 'sheet1' || map.sheets.length === 1)
+    ) {
+      const actualSheet = map.sheets[0]!.name;
+      const quoted = /^[A-Za-z0-9_]+$/.test(actualSheet) ? actualSheet : `'${actualSheet}'`;
+      return `${quoted}!${addrPart}`;
+    }
   } catch {
     return trimmed;
   }
+  return trimmed;
 }
 
 function tryParseEmulatedCall(text: string): { tool: string; args: unknown } | null {
@@ -996,13 +1089,84 @@ function tryParseEmulatedCall(text: string): { tool: string; args: unknown } | n
   }
 }
 
+const DEFERRED_OR_FAKE_STAGE_RE =
+  /\b(?:(?:kept|keeping) the (?:prior |previous )?staged version|previous version is already staged|won['’]t overwrite it|rather than overwriting|(?:i|i['’]ve|i have|we|we['’]ve)\s+(?:just\s+)?staged\b|(?:can|will|i['’]ll)\s+(?:stage|reorganize|rearrange|create|build|update)\b[\s\S]{0,140}\b(?:next|if you['’]d like|if you want))\b/i;
+
+function stripUserContextHeaders(userMessage: string): string {
+  return userMessage
+    .replace(/\[Attached Document:\s*[^\n\]]+?\]\r?\n```[^\r\n]*\r?\n[\s\S]*?\r?\n```/g, '')
+    .replace(/\[(?:Active Selection|📎 Selection):[^\]]*\]/gi, '')
+    .replace(/Relevant saved context:\n[\s\S]*$/i, '')
+    .trim();
+}
+
+/**
+ * Returns true when the model replied with plain text (`toolCalls.length === 0`) and `pendingOps.length === 0`
+ * on a turn where it either:
+ * 1. Refused to overwrite a prior turn's staged change-set or deferred staging to "next",
+ * 2. Hallucinated in text that it "staged" changes in this turn without calling any write tool, or
+ * 3. Received a direct user confirmation ("yes", "sounds good. let's do it") after a prior turn and
+ *    still emitted no write tool call.
+ */
+function shouldRetryDeferredOrUnstagedWrite(
+  assistantText: string,
+  userMessage: string,
+  history: ChatMessage[],
+): boolean {
+  if (DEFERRED_OR_FAKE_STAGE_RE.test(assistantText)) {
+    return true;
+  }
+
+  const cleanUser = stripUserContextHeaders(userMessage);
+  if (
+    history.length > 0 &&
+    cleanUser.length > 0 &&
+    cleanUser.length <= 80 &&
+    /^(?:yes|yep|yeah|sure|ok|okay|sounds good|let['’]?s do it|do it|go ahead|please do|stage it|apply it|proceed)[.!?\s,;:-]*(?:let['’]?s do it|do it|please|go ahead|stage it|now)*[.!?\s]*$/i.test(
+      cleanUser,
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /\b(?:reorganize|re-organize|rearrange|transpose|reformat|rebuild)\b/i.test(cleanUser) &&
+    !assistantText.trim().endsWith('?')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function buildDeferredWriteRetryNudge(
+  userMessage: string,
+  assistantText: string,
+  history: ChatMessage[],
+): string {
+  const recentText = [
+    ...history.slice(-4).map((m) => m.content),
+    userMessage,
+    assistantText,
+  ].join('\n');
+
+  const wantsHorizontalColumns =
+    /rows below|below the starting|rather than up\s*(?:and\s*)?down/i.test(recentText);
+
+  const layoutDirective = wantsHorizontalColumns
+    ? ' Arrange the overarching group headers across columns in Row 1, the individual item/column headers from left to right in Row 2, and the initial values in Row 3 so additional entries can be added in the rows below.'
+    : '';
+
+  return `[System note: You replied in plain text without calling write_range, so NOTHING was staged in this turn. Prior turns' staged change-sets never block overwriting, and you must NEVER defer staging to "next" or ask permission when the user already asked for the change. Immediately call write_range starting at "Sheet1!A1" RIGHT NOW to stage the requested table.${layoutDirective}]`;
+}
+
 /**
  * Builds a decisive recovery prompt when a local reasoning model exhausts tokens or ruminates
  * in `<think>` / `reasoning_content`:
  * 1. Uses `trimRuminatingReasoning` to preserve the initial extracted numbers/rows and strip
  *    trailing circular deliberation.
- * 2. Locks a concrete side-by-side layout decision if the user requested a left-to-right /
- *    horizontal layout so the model emits `write_range` immediately without further debate.
+ * 2. Locks a concrete layout decision when the user requested a horizontal / side-by-side
+ *    orientation so the model emits `write_range` immediately without further debate.
  */
 function buildReasoningRecoveryNudge(
   thinkingText: string,
@@ -1011,14 +1175,18 @@ function buildReasoningRecoveryNudge(
 ): string {
   const cleanedDraft = trimRuminatingReasoning(thinkingText.trim(), 2000);
   const combined = `${userMessage}\n${cleanedDraft}`;
-  const wantsSideBySide =
-    /left\s+to\s+right|side[\s-]+by[\s-]+side|horizontal|assets[\s\S]{0,60}left[\s\S]{0,60}(?:liabilities|equity)[\s\S]{0,60}right/i.test(
+  const wantsHorizontalColumns =
+    /rows below|below the starting|rather than up\s*(?:and\s*)?down/i.test(combined);
+  const wantsLeftToRight =
+    /left\s+to\s+right|side[\s-]+by[\s-]+side|horizontal|on the left[\s\S]{0,60}on the right/i.test(
       combined,
     );
 
-  const layoutLock = wantsSideBySide
-    ? '\n\nLAYOUT DECISION LOCKED: Use a single write_range call starting at "Sheet1!A1" with a 5-column side-by-side table where Columns A–B hold Assets [Account, Amount], Column C is a blank separator (null), and Columns D–E hold Liabilities & Equity [Account, Amount] (e.g. ["ASSETS", null, null, "LIABILITIES & EQUITY", null], ["Cash", 401900, null, "Accounts Payable", 220400]). Do NOT deliberate or consider any other layout — emit write_range immediately.'
-    : '';
+  const layoutLock = wantsHorizontalColumns
+    ? '\n\nLAYOUT DECISION LOCKED: Use a single write_range call starting at "Sheet1!A1" where categories/items are arranged as COLUMNS from left to right (overarching group headers in Row 1, individual column headers from left to right in Row 2, and initial values in Row 3 so new entries can be added in the rows below). Do NOT deliberate or consider any other layout — emit write_range immediately.'
+    : wantsLeftToRight
+      ? '\n\nLAYOUT DECISION LOCKED: Commit immediately to a single write_range call starting at "Sheet1!A1" that places the requested left-to-right sections across columns (either as column headers from left to right with values in the rows below, or as side-by-side column blocks separated by a null spacer column). Do NOT deliberate or compare alternative layouts — emit write_range immediately.'
+      : '';
 
   if (!cleanedDraft) {
     return `${baseNudge}${layoutLock}`;

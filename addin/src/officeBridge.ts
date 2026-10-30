@@ -39,7 +39,8 @@ export async function getWorkbookMap(): Promise<WorkbookMap> {
 
 export async function readRange(rangeRef: string): Promise<CellData[][]> {
   return Excel.run(async (context) => {
-    const range = getRange(context, rangeRef);
+    const resolver = await loadWorksheetResolver(context);
+    const range = getRange(context, rangeRef, resolver);
     range.load(['values', 'formulas']);
     await context.sync();
 
@@ -83,11 +84,10 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
   if (ops.length === 0) return;
 
   await Excel.run(async (context) => {
-    const addedSheets = new Map<string, Excel.Worksheet>();
+    const resolver = await loadWorksheetResolver(context);
     let pendingOpsCount = 0;
 
     for (const op of ops) {
-
       // If the upcoming op is structural and we have pending queued mutations,
       // flush them first so the sheet is in a consistent state.
       if (isStructuralOp(op) && pendingOpsCount > 0) {
@@ -97,52 +97,58 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
 
       switch (op.kind) {
         case 'add_sheet': {
-          const ws = context.workbook.worksheets.add(op.name);
-          addedSheets.set(op.name, ws);
-          // Structural: sync so the sheet exists in the workbook collection
-          await context.sync();
-          pendingOpsCount = 0;
+          const existing = resolver.findExisting(op.name);
+          if (existing) {
+            resolver.registerAdded(op.name, existing);
+          } else {
+            const ws = context.workbook.worksheets.add(op.name);
+            resolver.registerAdded(op.name, ws);
+            // Structural: sync so the sheet exists in the workbook collection
+            await context.sync();
+            pendingOpsCount = 0;
+          }
           break;
         }
         case 'clear_range': {
-          getRange(context, op.range, addedSheets).clear(Excel.ClearApplyTo.contents);
+          getRange(context, op.range, resolver).clear(Excel.ClearApplyTo.contents);
           pendingOpsCount++;
           break;
         }
         case 'rename_sheet': {
-          const sheet = addedSheets.get(op.name) ?? context.workbook.worksheets.getItem(op.name);
+          const sheet = resolver.getWorksheet(op.name);
           sheet.name = op.newName;
-          addedSheets.delete(op.name);
-          addedSheets.set(op.newName, sheet);
+          resolver.registerRenamed(op.name, op.newName, sheet);
           await context.sync();
           pendingOpsCount = 0;
           break;
         }
         case 'delete_sheet': {
-          const sheet = addedSheets.get(op.name) ?? context.workbook.worksheets.getItem(op.name);
-          sheet.delete();
-          addedSheets.delete(op.name);
-          await context.sync();
-          pendingOpsCount = 0;
+          const sheet = resolver.findExisting(op.name);
+          if (sheet) {
+            sheet.delete();
+            resolver.registerDeleted(op.name);
+            await context.sync();
+            pendingOpsCount = 0;
+          }
           break;
         }
         case 'insert_rows': {
           // Row addresses are 1-based in A1 notation; op.at is 0-based.
-          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
+          const sheet = resolver.getWorksheet(op.sheet);
           sheet.getRange(`${op.at + 1}:${op.at + op.count}`).insert(Excel.InsertShiftDirection.down);
           await context.sync();
           pendingOpsCount = 0;
           break;
         }
         case 'delete_rows': {
-          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
+          const sheet = resolver.getWorksheet(op.sheet);
           sheet.getRange(`${op.at + 1}:${op.at + op.count}`).delete(Excel.DeleteShiftDirection.up);
           await context.sync();
           pendingOpsCount = 0;
           break;
         }
         case 'insert_cols': {
-          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
+          const sheet = resolver.getWorksheet(op.sheet);
           sheet
             .getRange(`${indexToCol(op.at)}:${indexToCol(op.at + op.count - 1)}`)
             .insert(Excel.InsertShiftDirection.right);
@@ -151,7 +157,7 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
           break;
         }
         case 'delete_cols': {
-          const sheet = addedSheets.get(op.sheet) ?? context.workbook.worksheets.getItem(op.sheet);
+          const sheet = resolver.getWorksheet(op.sheet);
           sheet
             .getRange(`${indexToCol(op.at)}:${indexToCol(op.at + op.count - 1)}`)
             .delete(Excel.DeleteShiftDirection.left);
@@ -160,7 +166,7 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
           break;
         }
         case 'sort_range': {
-          const range = getRange(context, op.range, addedSheets);
+          const range = getRange(context, op.range, resolver);
           range.sort.apply(
             [{ key: op.keyOffset, ascending: op.ascending }],
             false,
@@ -171,7 +177,7 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
           break;
         }
         case 'format_range': {
-          const range = getRange(context, op.range, addedSheets);
+          const range = getRange(context, op.range, resolver);
           const f = op.format;
           if (f.numberFormat !== undefined) {
             // numberFormat must be a matrix matching the range dimensions.
@@ -217,7 +223,7 @@ export async function applyOps(ops: ChangeOp[]): Promise<void> {
           break;
         }
         case 'write_range': {
-          const range = getRange(context, op.range, addedSheets);
+          const range = getRange(context, op.range, resolver);
           // Setting `formulas` writes formulas for "=..." strings and treats
           // everything else as a literal value — one matrix handles both.
           const matrix = op.cells.map((row) =>
@@ -297,11 +303,14 @@ export async function findCells(
     const sheets = context.workbook.worksheets;
     sheets.load('items/name');
     await context.sync();
-    const targets = sheets.items.filter((ws) => !sheetName || ws.name === sheetName);
-    if (sheetName && targets.length === 0) throw new Error(`No such sheet: ${sheetName}`);
+    const cleanTarget = sheetName?.replace(/^'|'$/g, '').trim().toLowerCase();
+    const targets = sheets.items.filter(
+      (ws) => !cleanTarget || ws.name.trim().toLowerCase() === cleanTarget,
+    );
+    const effectiveTargets = targets.length > 0 ? targets : sheets.items;
 
     const matches: { address: string; value: string }[] = [];
-    for (const ws of targets) {
+    for (const ws of effectiveTargets) {
       const found = ws.findAllOrNullObject(query, { completeMatch: false, matchCase: false });
       found.load(['address', 'isNullObject']);
       await context.sync();
@@ -320,10 +329,74 @@ export async function findCells(
   });
 }
 
+interface WorksheetResolver {
+  getWorksheet(rawName: string): Excel.Worksheet;
+  findExisting(rawName: string): Excel.Worksheet | undefined;
+  registerAdded(name: string, ws: Excel.Worksheet): void;
+  registerRenamed(oldName: string, newName: string, ws: Excel.Worksheet): void;
+  registerDeleted(name: string): void;
+}
+
+/**
+ * Pre-loads the workbook's worksheet collection so range lookups can match
+ * sheet names case-insensitively and fall back to the active worksheet when a
+ * staged change-set references a default/renamed sheet name (e.g. "Sheet1")
+ * that does not exist in the current workbook, preventing Office.js
+ * `ItemNotFound: The requested resource doesn't exist.` failures on Apply.
+ */
+async function loadWorksheetResolver(context: Excel.RequestContext): Promise<WorksheetResolver> {
+  const sheets = context.workbook.worksheets;
+  const activeSheet = sheets.getActiveWorksheet();
+  sheets.load('items/name');
+  await context.sync();
+
+  const byExact = new Map<string, Excel.Worksheet>();
+  const byLower = new Map<string, Excel.Worksheet>();
+  for (const ws of sheets.items ?? []) {
+    byExact.set(ws.name, ws);
+    byLower.set(ws.name.trim().toLowerCase(), ws);
+  }
+
+  const findExisting = (rawName: string): Excel.Worksheet | undefined => {
+    const clean = rawName.replace(/^'|'$/g, '').trim();
+    if (!clean) return undefined;
+    return byExact.get(clean) ?? byLower.get(clean.toLowerCase());
+  };
+
+  return {
+    findExisting,
+    getWorksheet(rawName: string): Excel.Worksheet {
+      const clean = rawName.replace(/^'|'$/g, '').trim();
+      if (!clean || /\.(xlsx|xlsm|xlsb|xls|csv)$/i.test(clean)) {
+        return activeSheet;
+      }
+      return findExisting(clean) ?? activeSheet;
+    },
+    registerAdded(name: string, ws: Excel.Worksheet): void {
+      const clean = name.replace(/^'|'$/g, '').trim();
+      byExact.set(clean, ws);
+      byLower.set(clean.toLowerCase(), ws);
+    },
+    registerRenamed(oldName: string, newName: string, ws: Excel.Worksheet): void {
+      const cleanOld = oldName.replace(/^'|'$/g, '').trim();
+      const cleanNew = newName.replace(/^'|'$/g, '').trim();
+      byExact.delete(cleanOld);
+      byLower.delete(cleanOld.toLowerCase());
+      byExact.set(cleanNew, ws);
+      byLower.set(cleanNew.toLowerCase(), ws);
+    },
+    registerDeleted(name: string): void {
+      const clean = name.replace(/^'|'$/g, '').trim();
+      byExact.delete(clean);
+      byLower.delete(clean.toLowerCase());
+    },
+  };
+}
+
 function getRange(
   context: Excel.RequestContext,
   ref: string,
-  addedSheets?: Map<string, Excel.Worksheet>,
+  resolver?: WorksheetResolver,
 ): Excel.Range {
   const bang = ref.lastIndexOf('!');
   if (bang < 0) {
@@ -331,13 +404,13 @@ function getRange(
   }
   const sheetName = ref.slice(0, bang).replace(/^'|'$/g, '').trim();
   const address = ref.slice(bang + 1);
-  // Local models sometimes pass the workbook filename (e.g. "Book 2026-10-28.xlsx!A1:B5")
-  // instead of a worksheet tab name; route workbook filenames to the active worksheet.
+  if (resolver) {
+    return resolver.getWorksheet(sheetName).getRange(address);
+  }
   if (/\.(xlsx|xlsm|xlsb|xls|csv)$/i.test(sheetName)) {
     return context.workbook.worksheets.getActiveWorksheet().getRange(address);
   }
-  const sheet = addedSheets?.get(sheetName) ?? context.workbook.worksheets.getItem(sheetName);
-  return sheet.getRange(address);
+  return context.workbook.worksheets.getItem(sheetName).getRange(address);
 }
 
 /**
@@ -425,7 +498,8 @@ export async function selectRangeOnSheet(rangeRef: string): Promise<boolean> {
   if (typeof Excel === 'undefined') return false;
   try {
     return await Excel.run(async (context) => {
-      const range = getRange(context, rangeRef);
+      const resolver = await loadWorksheetResolver(context);
+      const range = getRange(context, rangeRef, resolver);
       range.select();
       await context.sync();
       return true;
@@ -434,5 +508,3 @@ export async function selectRangeOnSheet(rangeRef: string): Promise<boolean> {
     return false;
   }
 }
-
-

@@ -26,6 +26,7 @@ import { loadAndParseLocalFile, parseTabularContent } from './importers/tabular.
 import { McpManager, PathGuard } from './mcp/index.js';
 
 const SIDECAR_VERSION = '0.1.0';
+const MAX_CACHED_SESSIONS = 50;
 
 /** Origins allowed to talk to the sidecar (Office webviews + local dev). */
 const ALLOWED_ORIGIN_RE =
@@ -520,6 +521,7 @@ export async function startServer(options: {
   /* ---------------- WebSocket ---------------- */
 
   const wss = new WebSocketServer({ noServer: true });
+  const sessions = new Map<string, Session>();
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -570,16 +572,30 @@ export async function startServer(options: {
               return;
             }
             bridge = new BridgeExecutor(ws);
-            session = new Session(
-              ws,
-              msg.payload.workbookId,
-              msg.payload.workbookName,
-              bridge,
-              getProvider,
-              ledger,
-              memory,
-              mcpManager,
-            );
+            const existingSession = sessions.get(msg.payload.workbookId);
+            if (existingSession) {
+              existingSession.rebind(ws, msg.payload.workbookName, bridge);
+              session = existingSession;
+              // Refresh insertion order for LRU bounding
+              sessions.delete(msg.payload.workbookId);
+              sessions.set(msg.payload.workbookId, existingSession);
+            } else {
+              session = new Session(
+                ws,
+                msg.payload.workbookId,
+                msg.payload.workbookName,
+                bridge,
+                getProvider,
+                ledger,
+                memory,
+                mcpManager,
+              );
+              if (sessions.size >= MAX_CACHED_SESSIONS) {
+                const oldestKey = sessions.keys().next().value;
+                if (oldestKey !== undefined) sessions.delete(oldestKey);
+              }
+              sessions.set(msg.payload.workbookId, session);
+            }
             ws.send(
               JSON.stringify({
                 v: PROTOCOL_VERSION,
@@ -613,7 +629,9 @@ export async function startServer(options: {
     });
 
     ws.on('close', () => {
-      session?.handleAbort('Add-in disconnected');
+      if (session?.isCurrentSocket(ws)) {
+        session.handleAbort('Add-in disconnected');
+      }
       bridge?.abortAll('Add-in disconnected');
     });
   });

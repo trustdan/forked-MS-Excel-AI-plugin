@@ -831,4 +831,188 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(wb.getValue('Sheet1!E12')).toBe(1113200); // Total Equity
     expect(wb.getValue('Sheet1!E15')).toBe(1456100); // TOTAL LIAB. & EQUITY
   });
+
+  it('allows multi-turn layout reorganization after an initial write_range and retries automatically when the model defers overwriting a prior staged version', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+
+    // Turn 1: initial vertical balance sheet staged at Sheet1!A1 (>1200 chars of JSON)
+    const turn1Provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1',
+              cells: [
+                ['Pax Vans - Balance Sheet as of 12/31/2024'],
+                ['ASSETS'],
+                ['Cash', 401900],
+                ['Raw Materials', 419500],
+                ['WIP Inventory', 0],
+                ['FG Inventory', 0],
+                ['Rental Vans', 469700],
+                ['Manufacturing Equipment, net', 165000],
+                ['Total Assets', { formula: '=SUM(B3:B8)' }],
+                ['LIABILITIES'],
+                ['Accounts Payable', 220400],
+                ['Deferred Revenue', 122500],
+                ['Total Liabilities', { formula: '=SUM(B11:B12)' }],
+                ["SHAREHOLDERS' EQUITY"],
+                ['Common Stock', 1250000],
+                ['Retained Earnings', -136800],
+                ['Total Equity', { formula: '=SUM(B15:B16)' }],
+              ],
+              reason: 'Initial vertical balance sheet',
+            },
+          },
+        ],
+      },
+      { text: 'Staged the vertical balance sheet.' },
+    ]);
+
+    const turn1Events: AgentEvent[] = [];
+    const turn1Res = await runAgentTurn({
+      provider: turn1Provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book.xlsx',
+      history: [],
+      userMessage: 'Create the 2024 balance sheet',
+      onEvent: (ev) => turn1Events.push(ev),
+    });
+
+    expect(turn1Res.stagedChangeSetId).toBeDefined();
+
+    // Turn 2: User asks to reorganize left-to-right with accounts across columns and transactions in rows below.
+    // On Step 1 of Turn 2, the model tries to refuse overwriting the prior staged version ("I've kept the staged version as-is...").
+    // The loop catches the deferred refusal, suppresses the refusal text, and forces the actual write_range call on Step 2.
+    const turn2Provider = new ScriptedProvider([
+      {
+        text: 'Yes — I can reorganize it into a left-to-right layout. I’ve kept the staged version as-is rather than overwriting it again; I can stage the reorganized version next if you’d like.',
+      },
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1',
+              cells: [
+                ['', 'ASSETS', null, null, null, null, null, 'LIABILITIES', null, "SHAREHOLDERS' EQUITY", null],
+                [
+                  'Transaction / Description',
+                  'Cash',
+                  'Raw Materials',
+                  'WIP Inventory',
+                  'FG Inventory',
+                  'Rental Vans',
+                  'Manufacturing Equipment, net',
+                  'Accounts Payable',
+                  'Deferred Revenue',
+                  'Common Stock',
+                  'Retained Earnings',
+                ],
+                [
+                  '2025 Starting Balance (12/31/2024)',
+                  401900,
+                  419500,
+                  0,
+                  0,
+                  469700,
+                  165000,
+                  220400,
+                  122500,
+                  1250000,
+                  -136800,
+                ],
+              ],
+              reason: 'Reorganize accounts horizontally left-to-right with starting balances in Row 3',
+            },
+          },
+        ],
+      },
+      { text: 'Reorganized the 2025 starting balances horizontally from left to right.' },
+    ]);
+
+    const turn2Events: AgentEvent[] = [];
+    const turn2Res = await runAgentTurn({
+      provider: turn2Provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book.xlsx',
+      history: turn1Res.history,
+      userMessage:
+        '[📎 Selection: Sheet1!A1]\ncan you reorganize it left to right rather than up down; it should be sorted by overarching assets on left, liabilities, then equity on the right, such that we can add the accounts / transactions in the rows below the starting balances',
+      onEvent: (ev) => turn2Events.push(ev),
+    });
+
+    // 1. Prior turn's tool message in providerMessages was updated so it never says "Do NOT call write_range"
+    const turn1ToolMsgInTurn2 = turn2Provider.requests
+      .at(0)
+      ?.messages.find((m) => m.role === 'tool');
+    expect(turn1ToolMsgInTurn2?.content).not.toContain('Do NOT call write_range');
+    expect(turn1ToolMsgInTurn2?.content).toContain('Completed in a previous turn');
+
+    // 2. The refusal text ("kept the staged version as-is") was NOT emitted as a user-visible text event
+    const textEvents = turn2Events.filter((e) => e.kind === 'text');
+    expect(textEvents).toEqual([
+      {
+        kind: 'text',
+        text: 'Reorganized the 2025 starting balances horizontally from left to right.',
+      },
+    ]);
+
+    // 3. The reorganized horizontal table was staged and applies cleanly
+    expect(turn2Res.stagedChangeSetId).toBeDefined();
+    const applied = await changeSets.apply(turn2Res.stagedChangeSetId!);
+    expect(applied.ok).toBe(true);
+    expect(wb.getValue('Sheet1!B1')).toBe('ASSETS');
+    expect(wb.getValue('Sheet1!H1')).toBe('LIABILITIES');
+    expect(wb.getValue('Sheet1!J1')).toBe("SHAREHOLDERS' EQUITY");
+    expect(wb.getValue('Sheet1!B2')).toBe('Cash');
+    expect(wb.getValue('Sheet1!B3')).toBe(401900);
+    expect(wb.getValue('Sheet1!K2')).toBe('Retained Earnings');
+    expect(wb.getValue('Sheet1!K3')).toBe(-136800);
+  });
+
+  it('resolves default "Sheet1!A1" writes to the actual worksheet tab when Sheet1 does not exist so Apply succeeds', async () => {
+    const wb = new WorkbookEmulator(['2025 Balances']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1:C2',
+              cells: [
+                ['Cash', 'Raw Materials', 'Total Current Assets'],
+                [401900, 419500, { formula: '=SUM(A2:B2)' }],
+              ],
+              reason: 'List 2025 starting balances horizontally',
+            },
+          },
+        ],
+      },
+      { text: 'Staged starting balances.' },
+    ]);
+
+    const events: AgentEvent[] = [];
+    const res = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book.xlsx',
+      history: [],
+      userMessage: 'Stage starting balances horizontally',
+      onEvent: (ev) => events.push(ev),
+    });
+
+    expect(res.stagedChangeSetId).toBeDefined();
+    const applied = await changeSets.apply(res.stagedChangeSetId!);
+    expect(applied.ok).toBe(true);
+    expect(wb.getValue("'2025 Balances'!A1")).toBe('Cash');
+    expect(wb.getValue("'2025 Balances'!C2")).toBe(821400);
+  });
 });

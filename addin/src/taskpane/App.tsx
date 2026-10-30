@@ -46,14 +46,20 @@ function closeActiveActivities(items: ChatItem[]): ChatItem[] {
 
 function appendThinkingDelta(items: ChatItem[], delta: string): ChatItem[] {
   if (!delta) return items;
-  const last = items[items.length - 1];
-  if (last && last.kind === 'activity' && last.active) {
+  const rawLast = items[items.length - 1];
+  // If a prior step streamed an unfinalized assistant draft that was rejected/retried
+  // before a finalized `text` event arrived, discard the draft bubble and resume activity.
+  const baseItems =
+    rawLast && rawLast.kind === 'assistant' && rawLast.streaming ? items.slice(0, -1) : items;
+  const last = baseItems[baseItems.length - 1];
+  if (last && last.kind === 'activity') {
     const lastStep = last.steps[last.steps.length - 1];
     if (lastStep && lastStep.kind === 'thinking' && lastStep.durationMs === undefined) {
       return [
-        ...items.slice(0, -1),
+        ...baseItems.slice(0, -1),
         {
           ...last,
+          active: true,
           steps: [
             ...last.steps.slice(0, -1),
             { ...lastStep, text: lastStep.text + delta },
@@ -62,15 +68,16 @@ function appendThinkingDelta(items: ChatItem[], delta: string): ChatItem[] {
       ];
     }
     return [
-      ...items.slice(0, -1),
+      ...baseItems.slice(0, -1),
       {
         ...last,
+        active: true,
         steps: [...last.steps, { kind: 'thinking', text: delta }],
       },
     ];
   }
   return [
-    ...items,
+    ...baseItems,
     {
       kind: 'activity',
       steps: [{ kind: 'thinking', text: delta }],

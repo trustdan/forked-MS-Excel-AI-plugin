@@ -32,9 +32,13 @@ export class ChangeSetManager {
   private changeSets = new Map<string, ChangeSet>();
 
   constructor(
-    private readonly executor: WorkbookExecutor,
+    private executor: WorkbookExecutor,
     private readonly workbookId: string,
   ) {}
+
+  setExecutor(executor: WorkbookExecutor): void {
+    this.executor = executor;
+  }
 
   stage(ops: ChangeOp[]): ChangeSet {
     // Structural/format ops are not snapshot-restorable in v1: undo restores
@@ -128,7 +132,12 @@ export class ChangeSetManager {
     const problems: string[] = [];
     for (const op of cs.ops) {
       if (op.kind !== 'write_range' && op.kind !== 'clear_range' && op.kind !== 'sort_range') continue;
-      const after = await this.executor.readRange(op.range);
+      let after: CellData[][];
+      try {
+        after = await this.executor.readRange(op.range);
+      } catch {
+        continue;
+      }
       for (const [r, row] of after.entries()) {
         for (const [c, cell] of row.entries()) {
           if (typeof cell.value === 'string' && cell.value.startsWith('#')) {

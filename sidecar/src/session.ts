@@ -19,16 +19,31 @@ export class Session {
   private currentAbortController: AbortController | null = null;
 
   constructor(
-    private readonly ws: WebSocket,
+    private ws: WebSocket,
     readonly workbookId: string,
-    private readonly workbookName: string,
-    private readonly executor: WorkbookExecutor,
+    private workbookName: string,
+    private executor: WorkbookExecutor,
     private readonly getProvider: () => Provider,
     private readonly ledger: Ledger,
     private readonly memory: MemoryStore,
     private readonly mcpManager?: McpManager,
   ) {
     this.changeSets = new ChangeSetManager(executor, workbookId);
+  }
+
+  /**
+   * Rebinds the session to a new WebSocket connection and BridgeExecutor when
+   * the add-in reconnects, preserving staged change-sets and chat history.
+   */
+  rebind(ws: WebSocket, workbookName: string, executor: WorkbookExecutor): void {
+    this.ws = ws;
+    this.workbookName = workbookName;
+    this.executor = executor;
+    this.changeSets.setExecutor(executor);
+  }
+
+  isCurrentSocket(ws: WebSocket): boolean {
+    return this.ws === ws;
   }
 
   private emit(payload: Parameters<typeof makeEnvelope<'agent_event', unknown>>[1]): void {
@@ -110,6 +125,11 @@ export class Session {
 
   async handleApprove(changeSetId: string): Promise<void> {
     try {
+      const existing = this.changeSets.get(changeSetId);
+      if (existing?.status === 'applied') {
+        this.emit({ kind: 'changeset_applied', changeSetId });
+        return;
+      }
       const result = await this.changeSets.apply(changeSetId);
       if (result.ok) {
         this.emit({ kind: 'changeset_applied', changeSetId });
