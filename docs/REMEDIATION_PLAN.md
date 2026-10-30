@@ -126,28 +126,30 @@ Phases 1 and 3 overlap mainly in `server.ts` and `shared/src/protocol.ts`, so tw
 
 ## Tracking
 
-| ID | Priority | Epic | Phase | Status |
-| --- | --- | --- | --- | --- |
-| F1 | P1 | E1 | 1 | done |
-| F2 | P1 | E3 | 2 | done |
-| F3 | P1 | E2a | 1 | done |
-| F4 | P1 | E3 | 2 | done |
-| F5 | P1 | E0 → E4 | 0 / 3 | done |
-| F6 | P1 | E0 → E5 | 0 / 3 | done |
-| F7 | P2 | E5 | 3 | done |
-| F8 | P2 | E2c | 2 | done |
-| F9 | P2 | E6 | 3 | done |
-| F10 | P2 | E6 | 3 | done |
-| F11 | P2 | E6 | 3 | done |
-| F12 | P2 | E7 | 4 | done |
-| C1 Partial apply rollback | P1 | E2b | 1 | done |
-| C2 Hostname/socket pinning | P1 | E5 | 3 | done |
-| C3 Anthropic `/v1` | P2 | E5 | 3 | done |
-| C4 FS read allocation | P2 | E6 | 3 | done |
-| C5 Settings corruption | P2 | E7 | 4 | done |
-| C6 Cloud docs mismatch | P2 | E9 | 4 | done |
-| C7 CI `--ignore-scripts` / README count | P3 | E0 / E9 | 0 / 4 | done |
-| L1 Embedded provider cleanup | — | E8 | 4 | done |
-| L2 MCP stdio deadlines | — | E8 | 4 | done |
-| L3 Retention budgets | — | E7 | 4 | done |
-| L4 Firewall IPv6 | — | E8 | 4 | done (rule creation on an elevated test machine pending) |
+**Closed 2026-10-30.** Every finding is resolved; L4 still needs its firewall rules created and checked on an elevated test machine (the script's rule generation is tested). Hashes are the epic commits on their remediation branches; E2c landed as `b7e1a7c` ("more work to be done").
+
+| ID | Priority | Epic | Phase | Status | Resolved in |
+| --- | --- | --- | --- | --- | --- |
+| F1 | P1 | E1 | 1 | done | `d80e928` |
+| F2 | P1 | E3 | 2 | done | `618ab8e` |
+| F3 | P1 | E2a | 1 | done | `a400cf6` |
+| F4 | P1 | E3 | 2 | done | `618ab8e` |
+| F5 | P1 | E0 → E4 | 0 / 3 | done | `d80e928` → `1f183b2` |
+| F6 | P1 | E0 → E5 | 0 / 3 | done | `d80e928` → `e45cea1` |
+| F7 | P2 | E5 | 3 | done | `e45cea1` |
+| F8 | P2 | E2c | 2 | done | `b7e1a7c` |
+| F9 | P2 | E6 | 3 | done | `6d5bc19` |
+| F10 | P2 | E6 | 3 | done | `6d5bc19` |
+| F11 | P2 | E6 | 3 | done | `6d5bc19` |
+| F12 | P2 | E7 | 4 | done | `ed82ffb` |
+| C1 Partial apply rollback | P1 | E2b | 1 | done | `a49dd82` |
+| C2 Hostname/socket pinning | P1 | E5 | 3 | done | `e45cea1` |
+| C3 Anthropic `/v1` | P2 | E5 | 3 | done | `e45cea1` |
+| C4 FS read allocation | P2 | E6 | 3 | done | `6d5bc19` |
+| C5 Settings corruption | P2 | E7 | 4 | done | `ed82ffb` |
+| C6 Cloud docs mismatch | P2 | E9 | 4 | done | `81e825c` |
+| C7 CI `--ignore-scripts` / README count | P3 | E0 / E9 | 0 / 4 | done | `d80e928` / `81e825c` |
+| L1 Embedded provider cleanup | — | E8 | 4 | done | `8d7daf2` |
+| L2 MCP stdio deadlines | — | E8 | 4 | done | `8d7daf2` |
+| L3 Retention budgets | — | E7 | 4 | done | `ed82ffb` |
+| L4 Firewall IPv6 | — | E8 | 4 | done (rule creation on an elevated test machine pending) | `8d7daf2` |
