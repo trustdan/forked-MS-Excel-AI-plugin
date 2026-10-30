@@ -464,6 +464,12 @@ header .ghost ~ .ghost {
   gap: 6px;
 }
 
+.cs-sheet {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
 .cs-ops {
   list-style: none;
   margin: 6px 0 0;

@@ -18,6 +18,7 @@ import { trimRuminatingReasoning, withRetry } from '../providers/index.js';
 import { extractThinking, extractToolCalls } from '../providers/embedded.js';
 import type { WorkbookExecutor } from '../workbook/executor.js';
 import type { ChangeSetManager } from '../changeset/manager.js';
+import { resolveSheetTargets } from '../changeset/targets.js';
 import { buildSystemPrompt, emulatedToolInstructions } from './prompts.js';
 import {
   generateImportChangeOps,
@@ -458,10 +459,17 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
   };
 
   if (pendingOps.length > 0) {
-    const cs = changeSets.stage(pendingOps);
-    const preview = await changeSets.preview(cs.id);
-    emit({ kind: 'changeset_staged', changeSetId: cs.id, preview });
-    result.stagedChangeSetId = cs.id;
+    try {
+      const cs = await changeSets.stage(pendingOps);
+      const preview = await changeSets.preview(cs.id);
+      emit({ kind: 'changeset_staged', changeSetId: cs.id, preview });
+      result.stagedChangeSetId = cs.id;
+    } catch (e) {
+      emit({
+        kind: 'error',
+        message: `The proposed changes could not be staged: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
   }
 
   if (!emittedAnything) {
@@ -645,6 +653,8 @@ async function executeToolCall(
         });
       }
       const op = toChangeOp(toolName, args);
+      const sheetProblem = await findSheetProblem([...pendingOps, op], getCachedMap);
+      if (sheetProblem) return errorResult(sheetProblem);
       if (op.kind === 'write_range') {
         const opAddr = parseA1(op.range);
         const startKey = `${opAddr.sheet.toLowerCase()}!R${opAddr.startRow}C${opAddr.startCol}`;
@@ -988,6 +998,28 @@ function summarize(name: ToolName, args: Record<string, unknown>): string {
       return String(args.filePath ?? '');
     default:
       return '';
+  }
+}
+
+/**
+ * Early feedback for the model: the same sheet resolution staging performs,
+ * run against the turn's cached map. Staging re-checks against a fresh map.
+ */
+async function findSheetProblem(
+  ops: ChangeOp[],
+  getCachedMap: () => Promise<WorkbookMap>,
+): Promise<string | null> {
+  let map: WorkbookMap;
+  try {
+    map = await getCachedMap();
+  } catch {
+    return null; // workbook unreachable; staging will report it
+  }
+  try {
+    resolveSheetTargets(ops, map);
+    return null;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
   }
 }
 

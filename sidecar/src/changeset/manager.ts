@@ -10,6 +10,7 @@ import {
   type RangeSnapshot,
 } from '@excelai/shared';
 import type { WorkbookExecutor } from '../workbook/executor.js';
+import { assertTargetsUnchanged, resolveSheetTargets } from './targets.js';
 
 const MAX_SNAPSHOT_CELLS = 100_000;
 
@@ -40,7 +41,9 @@ export class ChangeSetManager {
     this.executor = executor;
   }
 
-  stage(ops: ChangeOp[]): ChangeSet {
+  /** Resolves sheet targets against the live workbook; throws on an unknown sheet. */
+  async stage(stagedOps: ChangeOp[]): Promise<ChangeSet> {
+    const { ops, targets } = resolveSheetTargets(stagedOps, await this.executor.getWorkbookMap());
     // Structural/format ops are not snapshot-restorable in v1: undo restores
     // values and formulas exactly, but not sheet structure or formatting.
     const NON_RESTORABLE: ChangeOp['kind'][] = [
@@ -60,6 +63,7 @@ export class ChangeSetManager {
       createdAt: new Date().toISOString(),
       status: 'staged',
       ops,
+      targets,
       undoFidelity: hasStructural ? 'partial' : 'full',
     };
     this.changeSets.set(cs.id, cs);
@@ -100,6 +104,11 @@ export class ChangeSetManager {
 
   async apply(id: string): Promise<ApplyResult> {
     const cs = this.mustGet(id, 'staged');
+
+    // 0. Refuse to run if a target sheet was deleted or renamed since staging.
+    if (cs.targets.length > 0) {
+      assertTargetsUnchanged(cs.targets, await this.executor.getWorkbookMap());
+    }
 
     // 1. Snapshot affected ranges for undo.
     const snapshots: RangeSnapshot[] = [];

@@ -1015,4 +1015,35 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(wb.getValue("'2025 Balances'!A1")).toBe('Cash');
     expect(wb.getValue("'2025 Balances'!C2")).toBe(821400);
   });
+
+  it('feeds a missing-sheet error back to the model and stages only the corrected, exactly named target', async () => {
+    const wb = new WorkbookEmulator(['Payroll', 'Data']);
+    const provider = new ScriptedProvider([
+      {
+        toolCalls: [
+          { name: 'write_range', args: { range: 'Report!A1', cells: [[999]], reason: 'guess' } },
+        ],
+      },
+      {
+        toolCalls: [
+          { name: 'write_range', args: { range: 'data!A1', cells: [[1]], reason: 'corrected' } },
+        ],
+      },
+      { text: 'Staged on Data.' },
+    ]);
+
+    const { events, changeSets, stagedId } = await runScript(wb, provider);
+
+    const firstResult = provider.requests.at(1)?.messages.findLast((m) => m.role === 'tool');
+    expect(firstResult && 'content' in firstResult ? firstResult.content : '').toContain(
+      'No such sheet: Report. Sheets in this workbook: Payroll, Data',
+    );
+    const staged = events.find((e) => e.kind === 'changeset_staged');
+    expect(staged?.kind === 'changeset_staged' && staged.preview.map((p) => p.op)).toEqual([
+      { kind: 'write_range', range: 'Data!A1', cells: [[{ value: 1 }]], reason: 'corrected' },
+    ]);
+    expect((await changeSets.apply(stagedId!)).ok).toBe(true);
+    expect(wb.getValue('Data!A1')).toBe(1);
+    expect(wb.getValue('Payroll!A1')).toBeNull();
+  });
 });

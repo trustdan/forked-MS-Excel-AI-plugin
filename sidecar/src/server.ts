@@ -27,6 +27,9 @@ import { McpManager, PathGuard } from './mcp/index.js';
 
 const SIDECAR_VERSION = '0.1.0';
 const MAX_CACHED_SESSIONS = 50;
+// Largest legitimate frame is a tool_result carrying a range snapshot; 16 MiB
+// leaves headroom over MAX_SNAPSHOT_CELLS while staying far below ws's 100 MiB default.
+const MAX_WS_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
 /** Origins allowed to talk to the sidecar (Office webviews + local dev). */
 const ALLOWED_ORIGIN_RE =
@@ -520,7 +523,7 @@ export async function startServer(options: {
 
   /* ---------------- WebSocket ---------------- */
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
   const sessions = new Map<string, Session>();
 
   server.on('upgrade', (req, socket, head) => {
@@ -541,14 +544,25 @@ export async function startServer(options: {
     let session: Session | null = null;
     let bridge: BridgeExecutor | null = null;
 
+    ws.on('error', (err) => {
+      console.error('[ws] socket error:', err.message);
+    });
+
     ws.on('message', (raw) => {
-      void (async () => {
-        let msg: ClientMessage;
+      (async () => {
+        let parsed: unknown;
         try {
-          msg = JSON.parse(String(raw)) as ClientMessage;
+          parsed = JSON.parse(String(raw));
         } catch {
           return;
         }
+        // Stop-gap until envelopes are schema-validated: anything that isn't a
+        // plain object (null, arrays, primitives) is a protocol violation.
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          ws.close(1003, 'Malformed frame');
+          return;
+        }
+        const msg = parsed as ClientMessage;
         if (typeof msg.v !== 'number' || Math.floor(msg.v) !== PROTOCOL_VERSION) {
           ws.send(
             JSON.stringify({
@@ -625,7 +639,11 @@ export async function startServer(options: {
             await session?.handleUndo(msg.payload.changeSetId);
             break;
         }
-      })();
+      })().catch((err: unknown) => {
+        // A bad frame from one client must never take down the process.
+        console.error('[ws] message handler failed:', err instanceof Error ? err.message : err);
+        ws.close(1011, 'Internal error');
+      });
     });
 
     ws.on('close', () => {
@@ -725,7 +743,8 @@ async function listModels(config: {
       headers.authorization = `Bearer ${key}`;
     }
     assertLoopbackUrl(endpoint);
-    const res = await fetch(endpoint, { headers, signal: controller.signal });
+    // A redirect could point anywhere; the loopback check above only covers the first hop.
+    const res = await fetch(endpoint, { headers, signal: controller.signal, redirect: 'error' });
     if (!res.ok) return { models: [], error: `Endpoint answered ${res.status}` };
     const data = (await res.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };
     const items = data.data ?? data.models ?? [];

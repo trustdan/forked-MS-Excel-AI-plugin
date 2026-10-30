@@ -1,3 +1,5 @@
+import { createServer as createHttpServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import { openDb } from '../src/db.js';
@@ -155,6 +157,33 @@ describe('sidecar HTTP API', () => {
     ws.close();
   });
 
+  it('does not follow redirects during model discovery', async () => {
+    const { base, token } = await boot();
+    // Loopback endpoint whose /v1/models redirects to a second path that would succeed.
+    const upstream = createHttpServer((req, res) => {
+      if (req.url === '/v1/models') {
+        res.writeHead(302, { location: '/elsewhere/models' }).end();
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'redirected-model' }] }));
+      }
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = (upstream.address() as AddressInfo).port;
+      const res = await fetch(`${base}/api/providers/models`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'openai-compatible', baseUrl: `http://127.0.0.1:${port}/v1` }),
+      });
+      const body = (await res.json()) as { models: string[]; error?: string };
+      expect(body.models).toEqual([]);
+      expect(body.error).toBeDefined();
+    } finally {
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+
   it('lists models and saves embedded provider configuration', async () => {
     const { base, token } = await boot();
     const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
@@ -190,6 +219,80 @@ describe('sidecar HTTP API', () => {
     const embedded = getData.providers.find((p) => p.model === 'qwen2.5-7b-instruct-q4_k_m.gguf');
     expect(embedded).toBeDefined();
     expect(embedded?.kind).toBe('embedded');
+  });
+});
+
+describe('sidecar WebSocket hardening', () => {
+  async function connect(base: string, token: string): Promise<WebSocket> {
+    const ws = new WebSocket(`${base.replace('http', 'ws')}/ws?token=${token}`);
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+    });
+    return ws;
+  }
+
+  function closed(ws: WebSocket): Promise<number> {
+    return new Promise((resolve) => ws.once('close', (code) => resolve(code)));
+  }
+
+  async function hello(ws: WebSocket, token: string, workbookId: string): Promise<{ ok: boolean }> {
+    const ack = new Promise<{ ok: boolean }>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString()) as { type: string; payload: { ok: boolean } };
+        if (msg.type === 'hello_ack') resolve(msg.payload);
+      });
+    });
+    ws.send(
+      JSON.stringify({
+        v: 1,
+        id: 'h',
+        type: 'hello',
+        payload: { token, workbookId, workbookName: `${workbookId}.xlsx`, client: 'addin' },
+      }),
+    );
+    return ack;
+  }
+
+  it.each([
+    ['null', 'null'],
+    ['an array', '[]'],
+    ['a number', '42'],
+  ])('closes only the offending socket when sent %s', async (_label, frame) => {
+    const { base, token } = await boot();
+    const bystander = await connect(base, token);
+    const attacker = await connect(base, token);
+
+    const attackerClosed = closed(attacker);
+    attacker.send(frame);
+    expect(await attackerClosed).toBe(1003);
+
+    expect((await hello(bystander, token, 'wb-bystander')).ok).toBe(true);
+    const health = await fetch(`${base}/api/health`);
+    expect(health.status).toBe(200);
+    bystander.close();
+  });
+
+  it('closes the socket instead of crashing when a frame is missing its payload', async () => {
+    const { base, token } = await boot();
+    const bystander = await connect(base, token);
+    const attacker = await connect(base, token);
+
+    const attackerClosed = closed(attacker);
+    attacker.send(JSON.stringify({ v: 1, id: 'x', type: 'hello' }));
+    expect(await attackerClosed).toBe(1011);
+
+    expect((await hello(bystander, token, 'wb-bystander')).ok).toBe(true);
+    bystander.close();
+  });
+
+  it('rejects frames larger than the payload cap', async () => {
+    const { base, token } = await boot();
+    const ws = await connect(base, token);
+    ws.on('error', () => {});
+    const wsClosed = closed(ws);
+    ws.send('x'.repeat(16 * 1024 * 1024 + 1));
+    expect(await wsClosed).toBe(1009);
   });
 });
 

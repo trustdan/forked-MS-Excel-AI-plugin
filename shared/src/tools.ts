@@ -274,6 +274,8 @@ export interface ToolCallRequest {
 }
 
 export interface SheetInfo {
+  /** Stable worksheet identity (Office.js `worksheet.id`); survives renames. */
+  id: string;
   name: string;
   rowCount: number;
   colCount: number;
