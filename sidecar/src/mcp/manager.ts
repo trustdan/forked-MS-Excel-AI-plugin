@@ -18,11 +18,28 @@ export interface DispatchedToolInfo {
 export class McpManager {
   private clients = new Map<string, McpClient>();
   private toolMap = new Map<string, DispatchedToolInfo>();
+  /** Why a configured server is not running, from its last start attempt. */
+  private failures = new Map<string, string>();
+  private queue: Promise<void> = Promise.resolve();
+  /** Clients mid-handshake, so shutdown can stop them without waiting out a deadline. */
+  private starting = new Set<McpClient>();
+  private closed = false;
 
   /**
    * Synchronize active MCP clients with the given server configurations and global approved paths.
+   * Calls run one at a time, in order, so overlapping syncs never start two children for one server.
    */
-  async sync(configs: McpServerConfig[], globalApprovedPaths: string[] = []): Promise<void> {
+  sync(configs: McpServerConfig[], globalApprovedPaths: string[] = []): Promise<void> {
+    return this.serialized(() => this.syncNow(configs, globalApprovedPaths));
+  }
+
+  private serialized(task: () => Promise<void>): Promise<void> {
+    const run = this.queue.then(task);
+    this.queue = run.catch(() => {});
+    return run;
+  }
+
+  private async syncNow(configs: McpServerConfig[], globalApprovedPaths: string[]): Promise<void> {
     const desiredIds = new Set(configs.map((c) => c.id));
 
     // Close clients no longer present
@@ -35,6 +52,7 @@ export class McpManager {
 
     // Initialize or update clients
     for (const config of configs) {
+      if (this.closed) return;
       if (!config.enabled) {
         if (this.clients.has(config.id)) {
           await this.clients.get(config.id)!.close().catch(() => {});
@@ -63,12 +81,23 @@ export class McpManager {
         }
       }
 
+      this.failures.delete(config.id);
+      let client: McpClient | undefined;
       try {
-        const client = createMcpClient(effectiveConfig);
+        client = createMcpClient(effectiveConfig);
+        this.starting.add(client);
         await client.initialize();
+        if (this.closed) {
+          await client.close().catch(() => {});
+          return;
+        }
         this.clients.set(config.id, client);
       } catch (err) {
+        if (this.closed) return;
+        this.failures.set(config.id, err instanceof Error ? err.message : String(err));
         console.error(`[mcp] failed to initialize client "${config.name}":`, err);
+      } finally {
+        if (client) this.starting.delete(client);
       }
     }
 
@@ -213,7 +242,8 @@ export class McpManager {
         enabled: cfg.enabled,
         transport: cfg.transport,
         type: cfg.type,
-        status: cfg.enabled ? 'disconnected' : 'disconnected',
+        status: cfg.enabled && this.failures.has(cfg.id) ? 'error' : 'disconnected',
+        error: cfg.enabled ? this.failures.get(cfg.id) : undefined,
         toolCount: 0,
       };
     });
@@ -223,12 +253,14 @@ export class McpManager {
    * Close all active MCP connections on shutdown.
    */
   async closeAll(): Promise<void> {
-    for (const client of this.clients.values()) {
-      try {
-        await client.close();
-      } catch {}
-    }
-    this.clients.clear();
-    this.toolMap.clear();
+    this.closed = true;
+    // Stop children still in their handshake now; a sync in progress then
+    // returns instead of starting anything else.
+    await Promise.all([...this.starting].map((c) => c.close().catch(() => {})));
+    await this.serialized(async () => {
+      await Promise.all([...this.clients.values()].map((c) => c.close().catch(() => {})));
+      this.clients.clear();
+      this.toolMap.clear();
+    });
   }
 }

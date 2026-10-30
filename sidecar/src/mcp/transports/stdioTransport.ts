@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { join } from 'node:path';
 import type {
   McpServerConfig,
   McpServerStatus,
@@ -7,6 +8,7 @@ import type {
   McpToolResult,
 } from '@excelai/shared';
 import type { McpClient } from '../types.js';
+import { planSpawn } from './spawnCommand.js';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -22,91 +24,109 @@ interface JsonRpcResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface StdioLimits {
+  /** Deadline for spawn + `initialize` + `tools/list` together. */
+  handshakeTimeoutMs: number;
+  /** Deadline for any later request, such as `tools/call`. */
+  requestTimeoutMs: number;
+  /** Requests awaiting a response; more are refused rather than queued. */
+  maxPending: number;
+  /** How long close() waits for the child to exit after asking it to stop. */
+  exitGraceMs: number;
+}
+
+export const DEFAULT_STDIO_LIMITS: StdioLimits = {
+  handshakeTimeoutMs: 30_000,
+  requestTimeoutMs: 120_000,
+  maxPending: 32,
+  exitGraceMs: 2_000,
+};
+
+/** A deadline expired; raised as-is, unlike a caller's own abort. */
+export class McpTimeoutError extends Error {}
+
+interface Pending {
+  resolve: (value: unknown) => void;
+  reject: (err: Error) => void;
+}
+
 export class StdioMcpClient implements McpClient {
   readonly id: string;
   readonly name: string;
   readonly config: McpServerConfig;
+  private readonly limits: StdioLimits;
   private process: ChildProcess | null = null;
   private nextId = 1;
-  private pendingRequests = new Map<
-    number | string,
-    { resolve: (value: unknown) => void; reject: (err: Error) => void }
-  >();
+  private pendingRequests = new Map<number | string, Pending>();
   private statusState: 'connected' | 'disconnected' | 'error' = 'disconnected';
   private lastError?: string;
   private cachedTools: McpToolDefinition[] = [];
+  private initializing: Promise<void> | null = null;
 
-  constructor(config: McpServerConfig) {
+  constructor(config: McpServerConfig, limits: Partial<StdioLimits> = {}) {
     this.id = config.id;
     this.name = config.name;
     this.config = config;
+    this.limits = { ...DEFAULT_STDIO_LIMITS, ...limits };
   }
 
-  async initialize(): Promise<void> {
-    if (this.process) return;
+  initialize(): Promise<void> {
+    if (this.process && this.statusState === 'connected') return Promise.resolve();
+    // Concurrent callers share one spawn instead of racing to start two children.
+    this.initializing ??= this.start().finally(() => {
+      this.initializing = null;
+    });
+    return this.initializing;
+  }
+
+  private async start(): Promise<void> {
     const command = this.config.command;
     if (!command) {
       throw new Error(`Command is required for stdio MCP server: ${this.name}`);
     }
 
+    // A child left over from a failed or crashed session is never reused.
+    if (this.process) await this.close();
+
+    const handshake = new AbortController();
+    const timer = setTimeout(
+      () => handshake.abort(new McpTimeoutError(`MCP server "${this.name}" did not complete its handshake within ${this.limits.handshakeTimeoutMs} ms`)),
+      this.limits.handshakeTimeoutMs,
+    );
     try {
-      const args = this.config.args ?? [];
       const env = {
         ...process.env,
         ...(this.config.env ?? {}),
       };
-
-      this.process = spawn(command, args, {
+      const plan = planSpawn(command, this.config.args ?? [], env);
+      const proc = spawn(plan.file, plan.args, {
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: process.platform === 'win32',
+        windowsHide: true,
+        windowsVerbatimArguments: plan.windowsVerbatimArguments,
       });
-
-      this.process.on('error', (err) => {
-        this.statusState = 'error';
-        this.lastError = err.message;
-        this.rejectAllPending(err);
-      });
-
-      this.process.on('exit', (code, signal) => {
-        this.statusState = 'disconnected';
-        if (code !== 0 && code !== null) {
-          this.lastError = `Process exited with code ${code} (${signal ?? 'none'})`;
-        }
-        this.rejectAllPending(new Error(`MCP process exited (${code})`));
-        this.process = null;
-      });
-
-      if (this.process.stdout) {
-        const rl = createInterface({ input: this.process.stdout });
-        rl.on('line', (line) => this.handleStdoutLine(line));
-      }
-
-      if (this.process.stderr) {
-        this.process.stderr.on('data', (data: Buffer) => {
-          // Keep debug logging for stderr
-          const msg = data.toString('utf8').trim();
-          if (msg) {
-            // Can be useful for diagnostics
-          }
-        });
-      }
+      this.process = proc;
+      this.attach(proc);
 
       // 1. Perform initialize handshake
-      const initResult = (await this.request('initialize', {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: {
-          name: 'excel-ai-sidecar',
-          version: '0.1.0',
+      await this.request(
+        'initialize',
+        {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: {
+            name: 'excel-ai-sidecar',
+            version: '0.1.0',
+          },
         },
-      })) as Record<string, unknown>;
+        { signal: handshake.signal, timeoutMs: 0 },
+      );
 
       // 2. Send initialized notification
       this.notify('notifications/initialized');
 
       // 3. Cache available tools
-      const toolsRes = (await this.request('tools/list', {})) as {
+      const toolsRes = (await this.request('tools/list', {}, { signal: handshake.signal, timeoutMs: 0 })) as {
         tools?: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
       };
 
@@ -119,11 +139,42 @@ export class StdioMcpClient implements McpClient {
       this.statusState = 'connected';
       this.lastError = undefined;
     } catch (e) {
+      await this.close();
       this.statusState = 'error';
       this.lastError = e instanceof Error ? e.message : String(e);
-      await this.close();
       throw e;
+    } finally {
+      clearTimeout(timer);
     }
+  }
+
+  /** Wire one child's events; each handler ignores a child that is no longer current. */
+  private attach(proc: ChildProcess): void {
+    proc.on('error', (err) => {
+      if (this.process !== proc) return;
+      this.statusState = 'error';
+      this.lastError = err.message;
+      this.rejectAllPending(err);
+    });
+
+    proc.on('exit', (code, signal) => {
+      if (this.process !== proc) return;
+      this.process = null;
+      this.statusState = code === 0 ? 'disconnected' : 'error';
+      this.lastError = code === 0 ? undefined : `Process exited with code ${code ?? 'none'} (${signal ?? 'none'})`;
+      this.rejectAllPending(new Error(`MCP server "${this.name}" exited (${code ?? signal})`));
+    });
+
+    // A write to a child that just died surfaces as an async EPIPE on stdin.
+    // Unhandled, that would crash the sidecar; the exit handler reports it.
+    proc.stdin?.on('error', () => {});
+
+    if (proc.stdout) {
+      const rl = createInterface({ input: proc.stdout });
+      rl.on('line', (line) => this.handleStdoutLine(line));
+    }
+    // Drain stderr so a chatty child never blocks on a full pipe.
+    proc.stderr?.resume();
   }
 
   async listTools(): Promise<McpToolDefinition[]> {
@@ -152,7 +203,7 @@ export class StdioMcpClient implements McpClient {
         name: toolName,
         arguments: args,
       },
-      options?.abortSignal,
+      { signal: options?.abortSignal },
     )) as {
       content?: Array<{ type: 'text'; text: string }>;
       isError?: boolean;
@@ -164,13 +215,27 @@ export class StdioMcpClient implements McpClient {
     };
   }
 
+  /**
+   * Send a JSON-RPC request. It settles exactly once: on the response, on
+   * abort, on its deadline (`timeoutMs`, 0 for none), or when the child exits.
+   */
   private request(
     method: string,
     params?: Record<string, unknown>,
-    abortSignal?: AbortSignal,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<unknown> {
-    if (!this.process || !this.process.stdin || this.process.stdin.destroyed) {
+    const proc = this.process;
+    if (!proc || !proc.stdin || proc.stdin.destroyed) {
       return Promise.reject(new Error(`MCP server "${this.name}" process is not running.`));
+    }
+    if (this.pendingRequests.size >= this.limits.maxPending) {
+      return Promise.reject(
+        new Error(`MCP server "${this.name}" has ${this.limits.maxPending} requests in flight; try again later.`),
+      );
+    }
+    const { signal } = options;
+    if (signal?.aborted) {
+      return Promise.reject(new Error('Operation aborted'));
     }
 
     const id = this.nextId++;
@@ -182,38 +247,42 @@ export class StdioMcpClient implements McpClient {
     };
 
     return new Promise((resolve, reject) => {
-      let abortHandler: (() => void) | undefined;
-      if (abortSignal) {
-        if (abortSignal.aborted) {
-          return reject(new Error('Operation aborted'));
-        }
-        abortHandler = () => {
-          this.pendingRequests.delete(id);
-          reject(new Error('Operation aborted'));
-        };
-        abortSignal.addEventListener('abort', abortHandler, { once: true });
-      }
+      const timeoutMs = options.timeoutMs ?? this.limits.requestTimeoutMs;
+      let timer: NodeJS.Timeout | undefined;
+
+      const settle = (fn: () => void): void => {
+        if (!this.pendingRequests.delete(id)) return;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
+      // Tell the server to stop work nobody is waiting for any more.
+      const giveUp = (err: Error): void =>
+        settle(() => {
+          this.notify('notifications/cancelled', { requestId: id, reason: err.message });
+          reject(err);
+        });
+      const onAbort = (): void => {
+        const reason = signal?.reason;
+        giveUp(reason instanceof McpTimeoutError ? reason : new Error('Operation aborted'));
+      };
 
       this.pendingRequests.set(id, {
-        resolve: (val) => {
-          if (abortHandler && abortSignal) {
-            abortSignal.removeEventListener('abort', abortHandler);
-          }
-          resolve(val);
-        },
-        reject: (err) => {
-          if (abortHandler && abortSignal) {
-            abortSignal.removeEventListener('abort', abortHandler);
-          }
-          reject(err);
-        },
+        resolve: (val) => settle(() => resolve(val)),
+        reject: (err) => settle(() => reject(err)),
       });
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (timeoutMs > 0) {
+        timer = setTimeout(
+          () => giveUp(new McpTimeoutError(`MCP server "${this.name}" did not answer "${method}" within ${timeoutMs} ms`)),
+          timeoutMs,
+        );
+      }
 
       try {
-        this.process!.stdin!.write(JSON.stringify(payload) + '\n');
+        proc.stdin!.write(JSON.stringify(payload) + '\n');
       } catch (err) {
-        this.pendingRequests.delete(id);
-        reject(err);
+        settle(() => reject(err instanceof Error ? err : new Error(String(err))));
       }
     });
   }
@@ -237,13 +306,12 @@ export class StdioMcpClient implements McpClient {
     if (!trimmed.startsWith('{')) return;
     try {
       const parsed = JSON.parse(trimmed) as JsonRpcResponse;
-      if (parsed.id !== undefined && this.pendingRequests.has(parsed.id)) {
-        const { resolve, reject } = this.pendingRequests.get(parsed.id)!;
-        this.pendingRequests.delete(parsed.id);
+      const pending = parsed.id !== undefined ? this.pendingRequests.get(parsed.id) : undefined;
+      if (pending) {
         if (parsed.error) {
-          reject(new Error(`MCP Error [${parsed.error.code}]: ${parsed.error.message}`));
+          pending.reject(new Error(`MCP Error [${parsed.error.code}]: ${parsed.error.message}`));
         } else {
-          resolve(parsed.result);
+          pending.resolve(parsed.result);
         }
       }
     } catch {
@@ -252,30 +320,40 @@ export class StdioMcpClient implements McpClient {
   }
 
   private rejectAllPending(err: Error): void {
-    for (const { reject } of this.pendingRequests.values()) {
+    for (const { reject } of [...this.pendingRequests.values()]) {
       reject(err);
     }
-    this.pendingRequests.clear();
   }
 
+  /** Stop the child and wait until it (and on Windows, its process tree) is gone. */
   async close(): Promise<void> {
     this.rejectAllPending(new Error('MCP Client closed'));
-    if (this.process) {
-      const proc = this.process;
-      this.process = null;
-      try {
-        proc.kill('SIGTERM');
-        // Give it 500ms before SIGKILL
-        setTimeout(() => {
-          if (!proc.killed) {
-            try {
-              proc.kill('SIGKILL');
-            } catch {}
-          }
-        }, 500).unref();
-      } catch {}
-    }
+    const proc = this.process;
+    this.process = null;
     this.statusState = 'disconnected';
+    // No pid means the spawn itself failed, so there is no exit to wait for.
+    if (!proc || proc.pid === undefined || proc.exitCode !== null || proc.signalCode !== null) return;
+
+    const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+    const waitExit = (ms: number): Promise<boolean> =>
+      Promise.race([
+        exited.then(() => true),
+        new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
+      ]);
+
+    proc.stdin?.end();
+    if (process.platform === 'win32') {
+      // TerminateProcess on the direct child would orphan anything it started
+      // (cmd.exe → npx → node), so kill the whole tree.
+      await killTree(proc.pid);
+      await waitExit(this.limits.exitGraceMs);
+      return;
+    }
+    proc.kill('SIGTERM');
+    if (!(await waitExit(this.limits.exitGraceMs))) {
+      proc.kill('SIGKILL');
+      await waitExit(this.limits.exitGraceMs);
+    }
   }
 
   getStatus(): McpServerStatus {
@@ -290,4 +368,14 @@ export class StdioMcpClient implements McpClient {
       tools: this.cachedTools.map((t) => ({ name: t.name, description: t.description })),
     };
   }
+}
+
+function killTree(pid: number | undefined): Promise<void> {
+  if (pid === undefined) return Promise.resolve();
+  const taskkill = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe');
+  return new Promise((resolve) => {
+    const killer = spawn(taskkill, ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    killer.once('error', () => resolve());
+    killer.once('exit', () => resolve());
+  });
 }

@@ -90,7 +90,7 @@ Press Ctrl+C to stop.
 ```
 
 > [!TIP]
-> **Windows Defender Firewall Isolation:** To enforce binary-level outbound network sandboxing on Windows, run `powershell -ExecutionPolicy Bypass -File scripts/lockdown-firewall.ps1` to configure a dedicated offline Node binary and start via `pnpm start:offline`.
+> **Windows Defender Firewall Isolation:** To enforce binary-level outbound network sandboxing on Windows, run `powershell -ExecutionPolicy Bypass -File scripts/lockdown-firewall.ps1` to configure a dedicated offline Node binary and start via `pnpm start:offline`. The rule blocks every non-loopback IPv4 and IPv6 address for that one executable. Stdio MCP servers run as separate processes: unless a server's command is `bin/node-offline.exe`, it is not covered and needs its own outbound block rule.
 
 ---
 

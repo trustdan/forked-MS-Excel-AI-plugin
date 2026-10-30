@@ -22,7 +22,7 @@ import type { Db } from './db.js';
 import { Ledger } from './ledger.js';
 import { MemoryStore } from './memory/store.js';
 import { FunctionEngine, FunctionQueueFullError } from './functions/batch.js';
-import { anthropicUrl, createProvider, ProviderError, getModelsDir, listLocalGgufModels, type Provider } from './providers/index.js';
+import { anthropicUrl, createProvider, disposeEmbeddedRuntime, ProviderError, getModelsDir, listLocalGgufModels, type Provider } from './providers/index.js';
 import { BridgeExecutor } from './bridge.js';
 import { Session } from './session.js';
 import { assertLoopbackUrl, guardedFetch } from './networkGuard.js';
@@ -101,7 +101,11 @@ export async function startServer(options: {
 
   try {
     const initialSettings = loadSettings();
-    await mcpManager.sync(initialSettings.mcpServers, initialSettings.approvedPaths);
+    // Not awaited: a slow or silent MCP child must not hold up the HTTP
+    // listener. Each server's status reports how its start went.
+    void mcpManager.sync(initialSettings.mcpServers, initialSettings.approvedPaths).catch((e) => {
+      console.error('[mcp] initial sync failed:', e);
+    });
   } catch (e) {
     // Keep serving so the taskpane can show the problem; every settings
     // route reports the same error until the file is readable again.
@@ -716,6 +720,7 @@ export async function startServer(options: {
     port: actualPort,
     close: async () => {
       await mcpManager.closeAll();
+      await disposeEmbeddedRuntime();
       wss.close();
       await new Promise<void>((resolve, reject) => {
         server.close((e) => (e ? reject(e) : resolve()));
