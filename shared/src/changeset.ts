@@ -62,7 +62,19 @@ export type ChangeOp =
       reason: string;
     };
 
-export type ChangeSetStatus = 'staged' | 'applied' | 'rejected' | 'undone';
+/**
+ * staged → applying → applied | failed_partial; applied → undoing → undone | failed_partial.
+ * A set never returns to `staged` once ops have reached the workbook, except
+ * after a verified rollback.
+ */
+export type ChangeSetStatus =
+  | 'staged'
+  | 'applying'
+  | 'applied'
+  | 'failed_partial'
+  | 'rejected'
+  | 'undoing'
+  | 'undone';
 
 export interface ChangeSet {
   id: string;
