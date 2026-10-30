@@ -35,7 +35,7 @@ export const toolSchemas = {
   },
   write_range: {
     description:
-      'Write a 2-D array of rows starting at a top-left cell (e.g. "Sheet1!A1"). Example: `{"range": "Sheet1!A1", "cells": [["ASSETS"], ["Cash", 401900], ["Raw Materials", 419500], ["Total", {"formula": "=SUM(B2:B3)"}]], "reason": "Add balance sheet"}`. Pass just the top-left cell like "Sheet1!A1" — the end row/column and padding for 1-cell header rows (`["ASSETS"]`) are computed automatically. Do NOT triple-nest rows (`[[["Cash", 100]]]` is wrong; use `[["Cash", 100]]`). Staged into a change-set for review.',
+      'Write a 2-D array of rows starting at a top-left cell (e.g. "Sheet1!A1"). Example vertical: `{"range": "Sheet1!A1", "cells": [["ASSETS"], ["Cash", 401900], ["Raw Materials", 419500], ["Total", {"formula": "=SUM(B2:B3)"}]], "reason": "Add balance sheet"}`. For side-by-side / left-to-right sections, include multiple columns per row in a single call (e.g. `["Cash", 401900, null, "Accounts Payable", 220400]`). Pass just the top-left cell like "Sheet1!A1" — the end row/column and padding for shorter header rows (`["ASSETS"]`) are computed automatically. Do NOT triple-nest rows (`[[["Cash", 100]]]` is wrong; use `[["Cash", 100]]`). Staged into a change-set for review.',
     parameters: z
       .object({
         range: z

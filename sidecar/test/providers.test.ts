@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AnthropicProvider } from '../src/providers/anthropic.js';
 import { OpenAIProvider } from '../src/providers/openai.js';
 import {
+  detectReasoningRumination,
   extractThinking,
   readSseStream,
   ThinkStreamSplitter,
+  trimRuminatingReasoning,
   withRetry,
 } from '../src/providers/index.js';
 import { ProviderError, type ChatDelta } from '../src/providers/types.js';
@@ -508,5 +510,47 @@ describe('SSE Streaming & ThinkStreamSplitter (Sprint 6.2)', () => {
 
     expect(res.stopReason).toBe('max_tokens');
     expect(res.reasoning).toBe('Drafted balance sheet rows 1..33.');
+  });
+
+  it('detects circular reasoning rumination, cuts off the SSE stream early, and trims repetitive deliberation paragraphs', async () => {
+    const initialPlan =
+      'We have Exhibit 1 balance sheet 12/31/2024.\nAssets:\nCash 401,900\nRaw Materials 419,500\nRental Vans 469,700\nManufacturing Equipment, net 165,000\nTotal Assets 1,456,100\n\nLiabilities & Equity:\nAccounts Payable 220,400\nDeferred Revenue 122,500\nCommon Stock 1,250,000\nRetained Earnings (136,800)\nTotal Liab & Equity 1,456,100';
+    const repeatedDeliberation =
+      'Perhaps they want a balance sheet where the assets are listed on the left side of the page and liabilities/equity on the right side, which is typical in a written balance sheet. In Excel, you might have assets in columns B-F and liabilities/equity in columns H-N, with assets on left and claims on right.';
+    const indecisionBlock =
+      "Maybe they want a single row. Maybe I should create a horizontal balance sheet. This is getting too complicated. Let's step back. Given the ambiguity, maybe we can put assets in column A.";
+
+    const fullRumination = [
+      initialPlan,
+      repeatedDeliberation,
+      indecisionBlock,
+      repeatedDeliberation,
+      indecisionBlock,
+    ].join('\n\n');
+
+    expect(detectReasoningRumination(fullRumination)).toBe(true);
+    const trimmed = trimRuminatingReasoning(fullRumination);
+    expect(trimmed).toContain('Cash 401,900');
+    expect(trimmed).toContain('Accounts Payable 220,400');
+    expect(trimmed).not.toContain("This is getting too complicated. Let's step back.");
+
+    vi.stubGlobal('fetch', async () =>
+      createSseResponse([
+        `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `${initialPlan}\n\n${repeatedDeliberation}\n\n` } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `${indecisionBlock}\n\n${repeatedDeliberation}` } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '\n\nMore endless rumination that should never be reached...' } }] })}\n\n`,
+      ]),
+    );
+
+    const p = new OpenAIProvider('qwen-local', 'lm-studio', 'http://127.0.0.1:1234/v1', 'openai-compatible');
+    const deltas: ChatDelta[] = [];
+    const res = await p.chat({
+      messages: [{ role: 'user', content: 'create left to right balance sheet' }],
+      onDelta: (d) => deltas.push(d),
+    });
+
+    expect(res.stopReason).toBe('max_tokens');
+    expect(res.reasoning).toContain('Cash 401,900');
+    expect(res.reasoning).not.toContain('More endless rumination');
   });
 });

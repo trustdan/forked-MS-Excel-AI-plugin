@@ -14,7 +14,7 @@ import {
   type WorkbookMap,
 } from '@excelai/shared';
 import type { ChatMessage, Provider, ToolSpec } from '../providers/types.js';
-import { withRetry } from '../providers/index.js';
+import { trimRuminatingReasoning, withRetry } from '../providers/index.js';
 import { extractThinking, extractToolCalls } from '../providers/embedded.js';
 import type { WorkbookExecutor } from '../workbook/executor.js';
 import type { ChangeSetManager } from '../changeset/manager.js';
@@ -301,10 +301,11 @@ export async function runAgentTurn(options: AgentTurnOptions): Promise<AgentTurn
           iteration + 1 < maxIterations
         ) {
           reasoningRecoveryCount++;
-          const reasoningTail = thinkingText.trim().slice(-2000);
-          const nudgeContent = reasoningTail
-            ? `${RECOVERY_NUDGE}\n\nHere is the end of your previous reasoning draft — use these exact values/rows and emit the tool call immediately without re-drafting:\n"""\n${reasoningTail}\n"""`
-            : RECOVERY_NUDGE;
+          const nudgeContent = buildReasoningRecoveryNudge(
+            thinkingText,
+            options.userMessage,
+            RECOVERY_NUDGE,
+          );
           const lastIdx = messages.length - 1;
           if (lastIdx >= 0 && recoveryMessageIndices.has(lastIdx)) {
             messages[lastIdx] = { role: 'user', content: nudgeContent };
@@ -996,6 +997,37 @@ function tryParseEmulatedCall(text: string): { tool: string; args: unknown } | n
 }
 
 /**
+ * Builds a decisive recovery prompt when a local reasoning model exhausts tokens or ruminates
+ * in `<think>` / `reasoning_content`:
+ * 1. Uses `trimRuminatingReasoning` to preserve the initial extracted numbers/rows and strip
+ *    trailing circular deliberation.
+ * 2. Locks a concrete side-by-side layout decision if the user requested a left-to-right /
+ *    horizontal layout so the model emits `write_range` immediately without further debate.
+ */
+function buildReasoningRecoveryNudge(
+  thinkingText: string,
+  userMessage: string,
+  baseNudge: string,
+): string {
+  const cleanedDraft = trimRuminatingReasoning(thinkingText.trim(), 2000);
+  const combined = `${userMessage}\n${cleanedDraft}`;
+  const wantsSideBySide =
+    /left\s+to\s+right|side[\s-]+by[\s-]+side|horizontal|assets[\s\S]{0,60}left[\s\S]{0,60}(?:liabilities|equity)[\s\S]{0,60}right/i.test(
+      combined,
+    );
+
+  const layoutLock = wantsSideBySide
+    ? '\n\nLAYOUT DECISION LOCKED: Use a single write_range call starting at "Sheet1!A1" with a 5-column side-by-side table where Columns A–B hold Assets [Account, Amount], Column C is a blank separator (null), and Columns D–E hold Liabilities & Equity [Account, Amount] (e.g. ["ASSETS", null, null, "LIABILITIES & EQUITY", null], ["Cash", 401900, null, "Accounts Payable", 220400]). Do NOT deliberate or consider any other layout — emit write_range immediately.'
+    : '';
+
+  if (!cleanedDraft) {
+    return `${baseNudge}${layoutLock}`;
+  }
+
+  return `${baseNudge}${layoutLock}\n\nHere is your cleaned reasoning draft — use these exact values/rows and emit the tool call immediately without re-drafting:\n"""\n${cleanedDraft}\n"""`;
+}
+
+/**
  * If a local reasoning model drafted a complete JSON tool call (or write_range args block)
  * inside `<think>` / `reasoning_content` and then hit `max_tokens` before emitting `tool_calls`,
  * extract the last valid JSON block so the turn succeeds immediately without another 5-minute retry.
@@ -1113,15 +1145,18 @@ function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[]
 
   for (let c = 0; c < maxCols; c++) {
     const colLetter = indexToCol(addr.startCol + c).toUpperCase();
-    const getCell = (sheetRow: number): unknown => {
+    const getCellAt = (colIdx: number, sheetRow: number): unknown => {
       const idx = sheetRow - baseRow;
       if (idx < 0 || idx >= rows.length) return undefined;
       const r = rows[idx];
-      return Array.isArray(r) ? r[c] : undefined;
+      return Array.isArray(r) ? r[colIdx] : undefined;
     };
-    const isNumericCell = (sheetRow: number): boolean => typeof getCell(sheetRow) === 'number';
-    const isFormulaCell = (sheetRow: number): boolean => {
-      const v = getCell(sheetRow);
+    const getCell = (sheetRow: number): unknown => getCellAt(c, sheetRow);
+    const isNumericCellAt = (colIdx: number, sheetRow: number): boolean =>
+      typeof getCellAt(colIdx, sheetRow) === 'number';
+    const isNumericCell = (sheetRow: number): boolean => isNumericCellAt(c, sheetRow);
+    const isFormulaCellAt = (colIdx: number, sheetRow: number): boolean => {
+      const v = getCellAt(colIdx, sheetRow);
       return (
         typeof v === 'object' &&
         v !== null &&
@@ -1129,6 +1164,7 @@ function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[]
         typeof (v as { formula: unknown }).formula === 'string'
       );
     };
+    const isFormulaCell = (sheetRow: number): boolean => isFormulaCellAt(c, sheetRow);
     const isEmptyCell = (sheetRow: number): boolean => {
       const v = getCell(sheetRow);
       return v === undefined || v === null || v === '';
@@ -1142,8 +1178,80 @@ function repairWriteRangeCells(rangeStr: string, rawCells: unknown[]): unknown[]
       const actualRow = baseRow + r;
       const rowArr = rows[r];
       if (!Array.isArray(rowArr) || !isFormulaCell(actualRow)) continue;
-      const formulaObj = rowArr[c] as { formula: string };
-      const formula = formulaObj.formula;
+      let formulaObj = rowArr[c] as { formula: string };
+      let formula = formulaObj.formula;
+
+      // 0. In side-by-side / multi-column tables (e.g. Assets in A:B, spacer in C, Liabilities in D:E),
+      //    models sometimes write =SUM(D5:D6) or =D7+D12 inside value column E (referencing the label column D).
+      //    If all referenced rows in that other column are strings/empty while the same rows in column `c` are
+      //    numeric/formula cells, rewrite the column letter to `colLetter`.
+      const preSumMatch = sumRangeRe.exec(formula);
+      if (
+        preSumMatch &&
+        preSumMatch[2]!.toUpperCase() === preSumMatch[6]!.toUpperCase() &&
+        preSumMatch[2]!.toUpperCase() !== colLetter
+      ) {
+        const otherColOffset = colToIndex(preSumMatch[2]!.toUpperCase()) - addr.startCol;
+        const sRow = parseInt(preSumMatch[4]!, 10);
+        const eRow = parseInt(preSumMatch[8]!, 10);
+        if (otherColOffset >= 0 && otherColOffset < maxCols && sRow <= eRow && eRow < actualRow) {
+          const rowSpan = Array.from({ length: eRow - sRow + 1 }, (_, i) => sRow + i);
+          const otherHasNumericOrFormula = rowSpan.some(
+            (k) => isNumericCellAt(otherColOffset, k) || isFormulaCellAt(otherColOffset, k),
+          );
+          const currentHasNumeric = rowSpan.some((k) => isNumericCell(k));
+          if (!otherHasNumericOrFormula && currentHasNumeric) {
+            formula = `=SUM(${preSumMatch[1]}${colLetter}${preSumMatch[3]}${sRow}:${preSumMatch[5]}${colLetter}${preSumMatch[7]}${eRow})`;
+            formulaObj = { formula };
+            rowArr[c] = formulaObj;
+          }
+        }
+      } else if (!preSumMatch) {
+        const refTokenRe = /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:|\s*\()/g;
+        let hasWrongLabelColRef = false;
+        let rm: RegExpExecArray | null;
+        while ((rm = refTokenRe.exec(formula)) !== null) {
+          const refCol = rm[3]!.toUpperCase();
+          if (refCol === colLetter) continue;
+          const otherColOffset = colToIndex(refCol) - addr.startCol;
+          const refRow = parseInt(rm[5]!, 10);
+          if (
+            otherColOffset >= 0 &&
+            otherColOffset < maxCols &&
+            refRow < actualRow &&
+            !isNumericCellAt(otherColOffset, refRow) &&
+            !isFormulaCellAt(otherColOffset, refRow) &&
+            (isNumericCell(refRow) || isFormulaCell(refRow))
+          ) {
+            hasWrongLabelColRef = true;
+            break;
+          }
+        }
+        if (hasWrongLabelColRef) {
+          formula = formula.replace(
+            /(^|[^:A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?!\s*:|\s*\()/g,
+            (full, prefix: string, d1: string, col: string, d2: string, rowDigits: string) => {
+              const refCol = col.toUpperCase();
+              if (refCol === colLetter) return full;
+              const otherColOffset = colToIndex(refCol) - addr.startCol;
+              const refRow = parseInt(rowDigits, 10);
+              if (
+                otherColOffset >= 0 &&
+                otherColOffset < maxCols &&
+                refRow < actualRow &&
+                !isNumericCellAt(otherColOffset, refRow) &&
+                !isFormulaCellAt(otherColOffset, refRow) &&
+                (isNumericCell(refRow) || isFormulaCell(refRow))
+              ) {
+                return `${prefix}${d1}${colLetter}${d2}${rowDigits}`;
+              }
+              return full;
+            },
+          );
+          formulaObj = { formula };
+          rowArr[c] = formulaObj;
+        }
+      }
 
       // 1. Check vertical =SUM(Col<sRow>:Col<eRow>)
       const sumMatch = sumRangeRe.exec(formula);

@@ -9,7 +9,9 @@ import { extractThinking } from './embedded.js';
 import {
   MAX_ACCUMULATED_TEXT_CHARS,
   ThinkStreamSplitter,
+  detectReasoningRumination,
   readSseStream,
+  trimRuminatingReasoning,
 } from './sse.js';
 import { assertLoopbackUrl, loopbackFetch } from '../networkGuard.js';
 
@@ -190,7 +192,12 @@ export class OpenAIProvider implements Provider {
     }
 
     const explicitReasoning = (choice.message.reasoning_content ?? choice.message.reasoning ?? '').trim();
-    const reasoningText = [explicitReasoning, inlineReasoning].filter(Boolean).join('\n\n');
+    const rawReasoningText = [explicitReasoning, inlineReasoning].filter(Boolean).join('\n\n');
+    const isRuminating =
+      !text.trim() && toolCalls.length === 0 && detectReasoningRumination(rawReasoningText);
+    const reasoningText = isRuminating
+      ? trimRuminatingReasoning(rawReasoningText)
+      : rawReasoningText;
     const reasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
     const outputTokens = data.usage?.completion_tokens ?? reasoningTokens;
 
@@ -203,10 +210,10 @@ export class OpenAIProvider implements Provider {
       text,
       toolCalls,
       reasoningText,
-      finishReason: choice.finish_reason,
+      finishReason: isRuminating ? 'length' : choice.finish_reason,
       promptTokens: data.usage?.prompt_tokens ?? 0,
       outputTokens,
-      reasoningTokens,
+      reasoningTokens: isRuminating ? Math.max(reasoningTokens, 1) : reasoningTokens,
     });
   }
 
@@ -217,9 +224,13 @@ export class OpenAIProvider implements Provider {
     let promptTokens = 0;
     let completionTokens: number | undefined;
     let reasoningTokens = 0;
+    let cutOffRumination = false;
 
     const toolCallMap = new Map<number, { id: string; name: string; arguments: string }>();
     const splitter = new ThinkStreamSplitter(options.onDelta);
+    const streamAbort = new AbortController();
+    const onCallerAbort = (): void => streamAbort.abort();
+    options.abortSignal?.addEventListener('abort', onCallerAbort, { once: true });
 
     try {
       await readSseStream(
@@ -307,14 +318,32 @@ export class OpenAIProvider implements Provider {
               }
             }
           }
+
+          const activeReasoning =
+            explicitReasoning.length > 0
+              ? explicitReasoning
+              : splitter.getAccumulatedReasoning();
+          if (
+            toolCallMap.size === 0 &&
+            !cutOffRumination &&
+            detectReasoningRumination(activeReasoning)
+          ) {
+            cutOffRumination = true;
+            finishReason = 'length';
+            reasoningTokens = Math.max(reasoningTokens, 1);
+            streamAbort.abort();
+          }
         },
-        { abortSignal: options.abortSignal },
+        { abortSignal: streamAbort.signal },
       );
     } catch (err) {
-      // If a local server emits a runaway SSE line or buffer overflow (e.g. GBNF whitespace loop
-      // inside a buffered tool_call), salvage the reasoning/content streamed so far and mark
-      // finishReason as 'length' so the agent loop can rescue or retry instead of crashing.
-      if (err instanceof ProviderError && err.status === 413) {
+      // If a local server emits a runaway SSE line, buffer overflow, or circular reasoning rumination,
+      // salvage the reasoning/content streamed so far and mark finishReason as 'length' so the agent
+      // loop can rescue or retry immediately instead of stalling or crashing.
+      if (cutOffRumination && !options.abortSignal?.aborted) {
+        finishReason = 'length';
+        reasoningTokens = Math.max(reasoningTokens, 1);
+      } else if (err instanceof ProviderError && err.status === 413) {
         finishReason = 'length';
         reasoningTokens = Math.max(reasoningTokens, 1);
         for (const [idx, entry] of toolCallMap.entries()) {
@@ -327,6 +356,8 @@ export class OpenAIProvider implements Provider {
       } else {
         throw err;
       }
+    } finally {
+      options.abortSignal?.removeEventListener('abort', onCallerAbort);
     }
 
     splitter.flush();
@@ -348,9 +379,12 @@ export class OpenAIProvider implements Provider {
       inlineReasoning = extracted.reasoning;
     }
 
-    const reasoningText = [explicitReasoning.trim(), inlineReasoning.trim()]
+    const rawReasoningText = [explicitReasoning.trim(), inlineReasoning.trim()]
       .filter(Boolean)
       .join('\n\n');
+    const reasoningText = cutOffRumination
+      ? trimRuminatingReasoning(rawReasoningText)
+      : rawReasoningText;
     const estimatedTokens = Math.ceil((rawContent.length + explicitReasoning.length) / 4);
     const outputTokens = completionTokens ?? (reasoningTokens > 0 ? reasoningTokens : estimatedTokens);
 

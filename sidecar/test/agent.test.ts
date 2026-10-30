@@ -749,4 +749,86 @@ describe('agent loop (full integration against the emulator)', () => {
     expect(turn2UserMsg?.content).toContain('Cash: 401,900');
     expect(result.history).toHaveLength(4);
   });
+
+  it('recovers from left-to-right layout rumination by locking a 5-column side-by-side decision and repairs wrong label-column references in right-hand value columns', async () => {
+    const wb = new WorkbookEmulator(['Sheet1']);
+    const changeSets = new ChangeSetManager(wb, 'wb-test');
+
+    const ruminatingThought = [
+      'We have Exhibit 1 balance sheet 12/31/2024.\nAssets:\nCash 401,900\nRaw Materials 419,500\nRental Vans 469,700\nManufacturing Equipment, net 165,000\n\nLiabilities:\nAccounts Payable 220,400\nDeferred Revenue 122,500\nCommon Stock 1,250,000\nRetained Earnings (136,800)',
+      'A5: "Cash" B5: 401900\nA6: "Raw Materials" B6: 419500',
+      "Maybe they want a horizontal balance sheet with assets in columns B-F and liabilities/equity in columns H-N. This is getting too complicated. Let's step back.",
+      "Perhaps they want a single row. Given the ambiguity, maybe I should just create a simple balance sheet. I think I'm overcomplicating.",
+    ].join('\n\n');
+
+    const provider = new ScriptedProvider([
+      {
+        text: '',
+        stopReason: 'max_tokens',
+        reasoning: ruminatingThought,
+      },
+      {
+        toolCalls: [
+          {
+            name: 'write_range',
+            args: {
+              range: 'Sheet1!A1',
+              cells: [
+                ['Pax Vans - Balance Sheet as of 12/31/2024'],
+                [''],
+                ['ASSETS', null, null, 'LIABILITIES & EQUITY', null],
+                ['Current Assets:', null, null, 'Current Liabilities:', null],
+                ['Cash', 401900, null, 'Accounts Payable', 220400],
+                ['Raw Materials', 419500, null, 'Deferred Revenue', 122500],
+                ['WIP Inventory', 0, null, 'Total Liabilities', { formula: '=SUM(D5:D6)' }],
+                ['FG Inventory', 0, null, null, null],
+                ['Total Current Assets', { formula: '=SUM(B5:B8)' }, null, "SHAREHOLDERS' EQUITY", null],
+                ['', null, null, 'Common Stock', 1250000],
+                ['Non-Current Assets:', null, null, 'Retained Earnings', -136800],
+                ['Rental Vans', 469700, null, 'Total Equity', { formula: '=SUM(D10:D11)' }],
+                ['Manufacturing Equipment, net', 165000, null, null, null],
+                ['PPE, Net', { formula: '=SUM(B12:B13)' }, null, null, null],
+                ['TOTAL ASSETS', { formula: '=B9+B14' }, null, 'TOTAL LIAB. & EQUITY', { formula: '=D7+D12' }],
+              ],
+              reason: 'Create 2024 side-by-side balance sheet with Assets on left and Liabilities & Equity on right',
+            },
+          },
+        ],
+      },
+      { text: 'Created the 2024 opening balance sheet side-by-side.' },
+    ]);
+
+    const events: AgentEvent[] = [];
+    const result = await runAgentTurn({
+      provider,
+      executor: wb,
+      changeSets,
+      workbookName: 'Book.xlsx',
+      history: [],
+      userMessage:
+        'can you create an accounting spreadsheet of the 2024 balances that 2025 started with, going from left to right, such that assets is on the left, liabilities and equity is on the right?',
+      onEvent: (ev) => events.push(ev),
+    });
+
+    // Recovery message locked the 5-column side-by-side layout and kept the initial balances while dropping trailing rumination
+    const recoveryUserMsg = provider.requests.at(1)?.messages.at(-1);
+    const recoveryText = recoveryUserMsg?.role === 'user' ? recoveryUserMsg.content : '';
+    expect(recoveryText).toContain('LAYOUT DECISION LOCKED');
+    expect(recoveryText).toContain('Cash 401,900');
+    expect(recoveryText).not.toContain("This is getting too complicated. Let's step back.");
+
+    expect(result.stagedChangeSetId).toBeDefined();
+    const applied = await changeSets.apply(result.stagedChangeSetId!);
+    expect(applied.ok).toBe(true);
+
+    // Left side (Assets in Column B)
+    expect(wb.getValue('Sheet1!B9')).toBe(821400); // Total Current Assets
+    expect(wb.getValue('Sheet1!B14')).toBe(634700); // PPE, Net
+    expect(wb.getValue('Sheet1!B15')).toBe(1456100); // TOTAL ASSETS
+
+    // Right side (Liabilities & Equity in Column E — repaired from D5:D6, D10:D11, and D7+D12)
+    expect(wb.getValue('Sheet1!E7')).toBe(342900); // Total Liabilities
+    expect(wb.getValue('Sheet1!E12')).toBe(1113200); // Total Equity
+    expect(wb.getValue('Sheet1!E15')).toBe(1456100); // TOTAL LIAB. & EQUITY
+  });
 });

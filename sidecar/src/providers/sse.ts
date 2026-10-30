@@ -223,14 +223,25 @@ export class ThinkStreamSplitter {
   private mode: 'text' | 'thinking' | 'tool_call' = 'text';
   private pending = '';
   private emittedAnyText = false;
+  private accumulatedReasoning = '';
 
   constructor(private readonly onDelta?: (delta: ChatDelta) => void) {}
+
+  /**
+   * Returns all reasoning text routed through this splitter so far (explicit + inline `<think>`).
+   */
+  getAccumulatedReasoning(): string {
+    return this.accumulatedReasoning;
+  }
 
   /**
    * Push an explicit reasoning delta (e.g. `delta.reasoning_content` or Anthropic `thinking_delta`).
    */
   pushReasoning(chunk: string): void {
     if (!chunk) return;
+    if (this.accumulatedReasoning.length + chunk.length <= MAX_ACCUMULATED_TEXT_CHARS) {
+      this.accumulatedReasoning += chunk;
+    }
     this.onDelta?.({ reasoning: chunk });
   }
 
@@ -238,7 +249,7 @@ export class ThinkStreamSplitter {
    * Push a raw content chunk that may contain inline `<think>`, `</think>`, or `<tool_call>` tags.
    */
   pushContent(chunk: string): void {
-    if (!chunk || !this.onDelta) return;
+    if (!chunk) return;
     this.pending += chunk;
     this.drain(false);
   }
@@ -247,7 +258,7 @@ export class ThinkStreamSplitter {
    * Flush any remaining partial buffer when the stream finishes.
    */
   flush(): void {
-    if (!this.onDelta || !this.pending) return;
+    if (!this.pending) return;
     this.drain(true);
   }
 
@@ -365,4 +376,95 @@ function computeTrailingTagPrefixLength(lowerText: string, tags: string[]): numb
   }
   return 0;
 }
+
+/**
+ * Maximum characters of pure internal reasoning allowed in a single streaming step
+ * before cutting off rumination and nudging the model to emit its tool call.
+ */
+export const MAX_REASONING_STREAM_CHARS = 3600;
+
+const INDECISION_MARKER_RE =
+  /\b(?:maybe (?:they|we|i) (?:want|should|can|could)|perhaps (?:they|we|i) (?:want|should|can|could)|this is (?:getting too complicated|messy)|let's step back|overcomplicating|given the ambiguity|let's re-read|hm+|actually,? careful)\b/gi;
+
+const INDECISION_PARAGRAPH_START_RE =
+  /^(?:maybe\b|perhaps\b|this is (?:getting too complicated|messy)\b|let's step back\b|i think i'm overcomplicating\b|let's re-read\b|given the ambiguity\b|alternatively\b|hmm\b)/i;
+
+/**
+ * Detects whether a streaming reasoning trace is stuck in a circular deliberation
+ * or verbatim repetition loop (common with local reasoning models at low temperature).
+ */
+export function detectReasoningRumination(
+  reasoning: string,
+  maxReasoningChars = MAX_REASONING_STREAM_CHARS,
+): boolean {
+  if (reasoning.length < 900) return false;
+
+  // Never interrupt if the model is actively drafting a fenced JSON block or <tool_call> tag
+  // that tryExtractToolCallFromReasoning can rescue.
+  const fenceCount = (reasoning.match(/```/g) ?? []).length;
+  if (fenceCount % 2 === 1) return false;
+  if (/<tool_call>(?![\s\S]*<\/tool_call>)/i.test(reasoning)) return false;
+
+  if (reasoning.length >= maxReasoningChars) {
+    return true;
+  }
+
+  const norm = reasoning.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (norm.length >= 900) {
+    const windowLen = 85;
+    const tail = norm.slice(-windowLen);
+    const searchSpace = norm.slice(0, norm.length - windowLen - 100);
+    if (tail.length === windowLen && searchSpace.includes(tail)) {
+      return true;
+    }
+  }
+
+  if (reasoning.length >= 1200) {
+    const matches = reasoning.match(INDECISION_MARKER_RE);
+    if (matches && matches.length >= 5) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Strips repetitive paragraphs and trailing circular deliberation from a reasoning
+ * trace while preserving the initial task breakdown, numbers, and cell mappings.
+ */
+export function trimRuminatingReasoning(reasoning: string, maxChars = 1800): string {
+  const paragraphs = reasoning
+    .split(/\r?\n\s*\r?\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length <= 1) {
+    const trimmed = reasoning.trim();
+    return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars).trimEnd()}…` : trimmed;
+  }
+
+  const seenFingerprints = new Set<string>();
+  const kept: string[] = [];
+
+  for (let i = 0; i < paragraphs.length; i++) {
+    const p = paragraphs[i]!;
+    const norm = p.replace(/\s+/g, ' ').toLowerCase();
+    const fp = norm.slice(0, 64);
+    if (fp.length >= 30 && seenFingerprints.has(fp)) {
+      continue;
+    }
+    if (i >= 2 && INDECISION_PARAGRAPH_START_RE.test(norm) && !/[A-Z]\d+\s*:/.test(p)) {
+      continue;
+    }
+    if (fp.length >= 30) {
+      seenFingerprints.add(fp);
+    }
+    kept.push(p);
+  }
+
+  const joined = kept.join('\n\n').trim();
+  return joined.length > maxChars ? `${joined.slice(0, maxChars).trimEnd()}…` : joined;
+}
+
 
