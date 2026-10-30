@@ -126,6 +126,10 @@ export function connect(options: {
         case 'agent_event':
           options.onEvent(msg.payload);
           break;
+        case 'protocol_error':
+          // The sidecar rejected a frame we sent: a client bug, so surface it.
+          options.onEvent({ kind: 'error', message: `Sidecar rejected a message: ${msg.payload.message}` });
+          break;
         case 'tool_exec': {
           const { requestId, tool, args } = msg.payload;
           try {

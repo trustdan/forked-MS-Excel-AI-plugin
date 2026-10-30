@@ -254,36 +254,113 @@ describe('sidecar WebSocket hardening', () => {
     return ack;
   }
 
+  type ProtocolErrorPayload = { message: string; issues: string[]; refId?: string };
+
+  function protocolError(ws: WebSocket): Promise<ProtocolErrorPayload> {
+    return new Promise((resolve) => {
+      const onMessage = (data: unknown): void => {
+        const msg = JSON.parse(String(data)) as { type: string; payload: ProtocolErrorPayload };
+        if (msg.type !== 'protocol_error') return;
+        ws.off('message', onMessage);
+        resolve(msg.payload);
+      };
+      ws.on('message', onMessage);
+    });
+  }
+
   it.each([
     ['null', 'null'],
     ['an array', '[]'],
     ['a number', '42'],
-  ])('closes only the offending socket when sent %s', async (_label, frame) => {
+    ['invalid JSON', '{"v":1,'],
+    ['a frame missing its payload', JSON.stringify({ v: 1, id: 'x', type: 'hello' })],
+    ['an unknown message type', JSON.stringify({ v: 1, id: 'x', type: 'drop_tables', payload: {} })],
+    [
+      'a hello with a wrongly typed field',
+      JSON.stringify({ v: 1, id: 'x', type: 'hello', payload: { token: 't', workbookId: 5, workbookName: 'a', client: 'addin' } }),
+    ],
+    ['a chat whose message is not a string', JSON.stringify({ v: 1, id: 'x', type: 'chat', payload: { message: {} } })],
+    ['a tool_result without ok', JSON.stringify({ v: 1, id: 'x', type: 'tool_result', payload: { requestId: 'r' } })],
+    ['a frame without an id', JSON.stringify({ v: 1, type: 'abort', payload: {} })],
+  ])('answers %s with a protocol error and keeps serving others', async (_label, frame) => {
     const { base, token } = await boot();
     const bystander = await connect(base, token);
     const attacker = await connect(base, token);
 
-    const attackerClosed = closed(attacker);
+    const rejected = protocolError(attacker);
     attacker.send(frame);
-    expect(await attackerClosed).toBe(1003);
+    const error = await rejected;
+    expect(error.message).toMatch(/malformed|JSON/i);
+    expect(attacker.readyState).toBe(WebSocket.OPEN);
 
+    // The offender can still speak the protocol correctly afterwards.
+    expect((await hello(attacker, token, 'wb-attacker')).ok).toBe(true);
     expect((await hello(bystander, token, 'wb-bystander')).ok).toBe(true);
     const health = await fetch(`${base}/api/health`);
     expect(health.status).toBe(200);
+    attacker.close();
     bystander.close();
   });
 
-  it('closes the socket instead of crashing when a frame is missing its payload', async () => {
+  it('names the offending field and echoes the frame id', async () => {
+    const { base, token } = await boot();
+    const ws = await connect(base, token);
+    const rejected = protocolError(ws);
+    ws.send(JSON.stringify({ v: 1, id: 'req-7', type: 'approve_changeset', payload: { changeSetId: 42 } }));
+    const error = await rejected;
+    expect(error.refId).toBe('req-7');
+    expect(error.issues.some((i) => i.startsWith('payload.changeSetId'))).toBe(true);
+    ws.close();
+  });
+
+  it('rejects binary frames', async () => {
+    const { base, token } = await boot();
+    const ws = await connect(base, token);
+    const rejected = protocolError(ws);
+    ws.send(Buffer.from(JSON.stringify({ v: 1, id: 'b', type: 'abort', payload: {} })));
+    expect((await rejected).message).toMatch(/binary/i);
+    ws.close();
+  });
+
+  it('closes a socket that keeps sending garbage while a second client and health stay responsive', async () => {
     const { base, token } = await boot();
     const bystander = await connect(base, token);
     const attacker = await connect(base, token);
+    const errors: ProtocolErrorPayload[] = [];
+    attacker.on('message', (data) => {
+      const msg = JSON.parse(String(data)) as { type: string; payload: ProtocolErrorPayload };
+      if (msg.type === 'protocol_error') errors.push(msg.payload);
+    });
 
     const attackerClosed = closed(attacker);
-    attacker.send(JSON.stringify({ v: 1, id: 'x', type: 'hello' }));
-    expect(await attackerClosed).toBe(1011);
-
-    expect((await hello(bystander, token, 'wb-bystander')).ok).toBe(true);
+    for (const frame of ['null', '[]', '"x"', '{}', 'nope']) {
+      if (attacker.readyState === WebSocket.OPEN) attacker.send(frame);
+    }
+    const [code, health, ack] = await Promise.all([
+      attackerClosed,
+      fetch(`${base}/api/health`),
+      hello(bystander, token, 'wb-bystander'),
+    ]);
+    expect(code).toBe(1008);
+    expect(errors.length).toBe(3);
+    expect(health.status).toBe(200);
+    expect(ack.ok).toBe(true);
     bystander.close();
+  });
+
+  it('still answers a protocol version mismatch with a failed hello_ack', async () => {
+    const { base, token } = await boot();
+    const ws = await connect(base, token);
+    const wsClosed = closed(ws);
+    const ack = new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(String(data)) as { type: string; payload: { ok: boolean; error?: string } };
+        if (msg.type === 'hello_ack') resolve(msg.payload);
+      });
+    });
+    ws.send(JSON.stringify({ v: 2, id: 'h', type: 'hello', payload: {} }));
+    expect(await ack).toMatchObject({ ok: false, error: expect.stringMatching(/version mismatch/) });
+    await wsClosed;
   });
 
   it('reports a change-set it no longer holds (e.g. after a restart) as unknown', async () => {
